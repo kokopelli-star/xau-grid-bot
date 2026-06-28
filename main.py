@@ -1,6 +1,8 @@
 from state import GridState
 from executor import GridManager
 from server import TradingServer
+import threading
+import MetaTrader5 as mt5
 
 if __name__ == "__main__":
     if not mt5.initialize():
