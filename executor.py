@@ -57,7 +57,28 @@ class GridManager:
         positions = mt5.positions_get(symbol=self.symbol)
         if positions:
             for pos in positions:
-                mt5.Close(self.symbol, ticket=pos.ticket)
+                tick = mt5.symbol_info_tick(self.symbol)
+                if tick is None:
+                    print(f"ティック情報の取得に失敗したため、ポジション {pos.ticket} をクローズできません")
+                    continue
+                close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": self.symbol,
+                    "volume": pos.volume,
+                    "type": close_type,
+                    "position": pos.ticket,
+                    "price": price,
+                    "deviation": 20,
+                    "magic": 123456,
+                    "comment": "grid close all",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+                result = mt5.order_send(request)
+                if result.retcode != mt5.TRADE_RETCODE_DONE:
+                    print(f"ポジションクローズ失敗: ticket={pos.ticket}, retcode={result.retcode}")
         print("全ポジション・注文をクリアしました")
 
     def run_executor(self):
