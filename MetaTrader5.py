@@ -30,8 +30,10 @@ else:
     ORDER_TYPE_BUY = 0
     TRADE_ACTION_REMOVE = 8
     TRADE_ACTION_DEAL = 1
+    TRADE_ACTION_SLTP = 6
     ORDER_TIME_GTC = 0
     TRADE_RETCODE_DONE = 10009
+
 
     class Tick:
         def __init__(self, bid=2350.0, ask=2350.5):
@@ -47,11 +49,15 @@ else:
             self.volume = volume
 
     class Position:
-        def __init__(self, ticket, symbol, type, volume):
+        def __init__(self, ticket, symbol, type, volume, price_open=0.0, sl=0.0, tp=0.0):
             self.ticket = ticket
             self.symbol = symbol
             self.type = type
             self.volume = volume
+            self.price_open = price_open
+            self.sl = sl
+            self.tp = tp
+
 
     _orders = []
     _positions = []
@@ -99,6 +105,17 @@ else:
             )
             _orders.append(new_order)
             print(f"[Mock MT5] Placed pending order: ticket={ticket}, price={new_order.price}")
+            
+            # Simulate order getting filled as a position immediately in mock mode
+            new_pos = Position(
+                ticket=ticket + 5000,
+                symbol=request.get("symbol"),
+                type=POSITION_TYPE_BUY,
+                volume=request.get("volume"),
+                price_open=request.get("price")
+            )
+            _positions.append(new_pos)
+            print(f"[Mock MT5] Position opened (filled from order): ticket={new_pos.ticket}, price_open={new_pos.price_open}")
         elif action == TRADE_ACTION_REMOVE:
             order_ticket = request.get("order")
             _orders = [o for o in _orders if o.ticket != order_ticket]
@@ -108,7 +125,16 @@ else:
             pos_ticket = request.get("position")
             _positions = [p for p in _positions if p.ticket != pos_ticket]
             print(f"[Mock MT5] Position closed: ticket={pos_ticket}")
+        elif action == TRADE_ACTION_SLTP:
+            pos_ticket = request.get("position")
+            for p in _positions:
+                if p.ticket == pos_ticket:
+                    p.sl = request.get("sl", 0.0)
+                    p.tp = request.get("tp", 0.0)
+                    print(f"[Mock MT5] SL/TP updated for position {pos_ticket}: SL={p.sl}, TP={p.tp}")
+                    break
         return OrderResult(TRADE_RETCODE_DONE)
+
 
     def copy_rates_from_pos(symbol, timeframe, start_pos, count):
         dtype = [

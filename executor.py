@@ -81,6 +81,69 @@ class GridManager:
                     print(f"ポジションクローズ失敗: ticket={pos.ticket}, retcode={result.retcode}")
         print("全ポジション・注文をクリアしました")
 
+    def handle_upward_breakout(self):
+        # 1. 未約定の注文（指値）を全てキャンセル
+        orders = mt5.orders_get(symbol=self.symbol)
+        if orders:
+            for order in orders:
+                mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket})
+            print("未約定の指値注文をすべてキャンセルしました")
+
+        # 2. ポジション取得
+        positions = mt5.positions_get(symbol=self.symbol)
+        if not positions:
+            print("ポジションがありません。指値のキャンセルのみ完了しました。")
+            return
+
+        # 3. 最も建値の良い（買いポジションなので価格が一番低い）ポジションを特定
+        best_pos = min(positions, key=lambda p: p.price_open)
+        print(f"最良建値ポジションを特定: ticket={best_pos.ticket}, price_open={best_pos.price_open}")
+
+        # 4. 最良ポジション以外（建値の悪いもの）を全決済
+        for pos in positions:
+            if pos.ticket == best_pos.ticket:
+                continue
+
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick is None:
+                print(f"ティック情報の取得に失敗したため、ポジション {pos.ticket} をクローズできません")
+                continue
+            close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+            price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": self.symbol,
+                "volume": pos.volume,
+                "type": close_type,
+                "position": pos.ticket,
+                "price": price,
+                "deviation": 20,
+                "magic": 123456,
+                "comment": "grid profit exit",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"建値の悪いポジションをクローズしました: ticket={pos.ticket}, price_open={pos.price_open}")
+            else:
+                print(f"ポジションクローズ失敗: ticket={pos.ticket}, retcode={result.retcode}")
+
+        # 5. 残した最良ポジションのストップロス（SL）を建値に変更してリスクフリーにする
+        sl_request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": best_pos.ticket,
+            "symbol": self.symbol,
+            "sl": round(best_pos.price_open, 2),  # 建値に変更
+            "tp": 0.0                             # 0.0 はTPなし
+        }
+        result = mt5.order_send(sl_request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"最良ポジション {best_pos.ticket} の逆指値(SL)を建値 {best_pos.price_open} に設定しました (リスクフリー化完了)")
+        else:
+            print(f"最良ポジションの逆指値設定に失敗しました: ticket={best_pos.ticket}, retcode={result.retcode}")
+
+
     def run_executor(self):
         while True:
             if self.state.is_new_request:
@@ -100,10 +163,16 @@ class GridManager:
                     atr = self.get_atr()
                     buffer = atr * self.atr_multiplier
 
-                    # 損切り判定: ゾーン外 + ATRバッファ
-                    if current_price > (self.state.max_price + buffer) or \
-                       current_price < (self.state.min_price - buffer):
-                        print(f"ゾーン逸脱検知! (Price: {current_price}, ATR: {atr:.2f})")
+                    # 損切り判定: ゾーン下限を下回る場合
+                    if current_price < (self.state.min_price - buffer):
+                        print(f"ゾーン下限逸脱（損切り）検知! (Price: {current_price}, ATR: {atr:.2f})")
                         self.close_all_positions()
                         self.state.min_price = 0.0 # 監視終了
+                    
+                    # 利確判定: ゾーン上限を上回る場合
+                    elif current_price > (self.state.max_price + buffer):
+                        print(f"ゾーン上限逸脱（利確）検知! (Price: {current_price}, ATR: {atr:.2f})")
+                        self.handle_upward_breakout()
+                        self.state.min_price = 0.0 # 監視終了
+
             time.sleep(1)
