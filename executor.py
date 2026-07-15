@@ -29,23 +29,27 @@ class GridManager:
         return np.mean(tr)
 
     def place_grid_orders(self):
-        # ゾーン内に5つの買い指値を配置
+        # ゾーン内に5つの指値を配置 (buy/sellに応じて注文タイプを変更)
         min_p = self.state.min_price
         max_p = self.state.max_price
         steps = [min_p + (max_p - min_p) * i / 4 for i in range(5)]
+
+        is_buy = (self.state.direction == "buy")
+        order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
 
         for price in steps:
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": self.symbol,
                 "volume": self.volume,
-                "type": mt5.ORDER_TYPE_BUY_LIMIT,
+                "type": order_type,
                 "price": round(price, 2),
                 "magic": 123456,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
             mt5.order_send(request)
-        print(f"グリッド注文配置完了: {min_p} - {max_p}")
+        print(f"グリッド注文配置完了 ({'買い' if is_buy else '売り'}): {min_p} - {max_p}")
+
 
     def close_all_positions(self):
         # 保有ポジションと指値を全決済・全キャンセル
@@ -81,7 +85,7 @@ class GridManager:
                     print(f"ポジションクローズ失敗: ticket={pos.ticket}, retcode={result.retcode}")
         print("全ポジション・注文をクリアしました")
 
-    def handle_upward_breakout(self):
+    def handle_breakout_exit(self, is_buy):
         # 1. 未約定の注文（指値）を全てキャンセル
         orders = mt5.orders_get(symbol=self.symbol)
         if orders:
@@ -95,9 +99,12 @@ class GridManager:
             print("ポジションがありません。指値のキャンセルのみ完了しました。")
             return
 
-        # 3. 最も建値の良い（買いポジションなので価格が一番低い）ポジションを特定
-        best_pos = min(positions, key=lambda p: p.price_open)
-        print(f"最良建値ポジションを特定: ticket={best_pos.ticket}, price_open={best_pos.price_open}")
+        # 3. 最も建値の良いポジションを特定（買いは最低価格、売りは最高価格）
+        if is_buy:
+            best_pos = min(positions, key=lambda p: p.price_open)
+        else:
+            best_pos = max(positions, key=lambda p: p.price_open)
+        print(f"最良建値ポジションを特定 ({'買い' if is_buy else '売り'}): ticket={best_pos.ticket}, price_open={best_pos.price_open}")
 
         # 4. 最良ポジション以外（建値の悪いもの）を全決済
         for pos in positions:
@@ -155,24 +162,39 @@ class GridManager:
     def run_monitor(self):
         print("監視ループ開始...")
         while True:
-            # ゾーンが設定されている場合のみ監視
-            if self.state.min_price > 0:
+            # ゾーンが設定されており、かつ新規配置リクエストの処理が完了している場合のみ監視
+            if self.state.min_price > 0 and not self.state.is_new_request:
                 tick = mt5.symbol_info_tick(self.symbol)
+
                 if tick:
                     current_price = tick.bid
                     atr = self.get_atr()
                     buffer = atr * self.atr_multiplier
+                    is_buy = (self.state.direction == "buy")
 
-                    # 損切り判定: ゾーン下限を下回る場合
+                    # 1. ゾーン下限の逸脱判定
                     if current_price < (self.state.min_price - buffer):
-                        print(f"ゾーン下限逸脱（損切り）検知! (Price: {current_price}, ATR: {atr:.2f})")
-                        self.close_all_positions()
+                        if is_buy:
+                            # 買いグリッドの場合：下限割れは「損切り」
+                            print(f"ゾーン下限逸脱（買い損切り）検知! (Price: {current_price}, ATR: {atr:.2f})")
+                            self.close_all_positions()
+                        else:
+                            # 売りグリッドの場合：下限割れは「利確」
+                            print(f"ゾーン下限逸脱（売り利確）検知! (Price: {current_price}, ATR: {atr:.2f})")
+                            self.handle_breakout_exit(is_buy=False)
                         self.state.min_price = 0.0 # 監視終了
                     
-                    # 利確判定: ゾーン上限を上回る場合
+                    # 2. ゾーン上限の逸脱判定
                     elif current_price > (self.state.max_price + buffer):
-                        print(f"ゾーン上限逸脱（利確）検知! (Price: {current_price}, ATR: {atr:.2f})")
-                        self.handle_upward_breakout()
+                        if is_buy:
+                            # 買いグリッドの場合：上限突破は「利確」
+                            print(f"ゾーン上限逸脱（買い利確）検知! (Price: {current_price}, ATR: {atr:.2f})")
+                            self.handle_breakout_exit(is_buy=True)
+                        else:
+                            # 売りグリッドの場合：上限突破は「損切り」
+                            print(f"ゾーン上限逸脱（売り損切り）検知! (Price: {current_price}, ATR: {atr:.2f})")
+                            self.close_all_positions()
                         self.state.min_price = 0.0 # 監視終了
 
             time.sleep(1)
+

@@ -24,15 +24,18 @@ else:
     TIMEFRAME_M15 = 15
     TRADE_ACTION_PENDING = 5
     ORDER_TYPE_BUY_LIMIT = 2
+    ORDER_TYPE_SELL_LIMIT = 3
     ORDER_FILLING_IOC = 1
     ORDER_TYPE_SELL = 1
     POSITION_TYPE_BUY = 0
+    POSITION_TYPE_SELL = 1
     ORDER_TYPE_BUY = 0
     TRADE_ACTION_REMOVE = 8
     TRADE_ACTION_DEAL = 1
     TRADE_ACTION_SLTP = 6
     ORDER_TIME_GTC = 0
     TRADE_RETCODE_DONE = 10009
+
 
 
     class Tick:
@@ -107,15 +110,16 @@ else:
             print(f"[Mock MT5] Placed pending order: ticket={ticket}, price={new_order.price}")
             
             # Simulate order getting filled as a position immediately in mock mode
+            is_buy = (request.get("type") == ORDER_TYPE_BUY_LIMIT)
             new_pos = Position(
                 ticket=ticket + 5000,
                 symbol=request.get("symbol"),
-                type=POSITION_TYPE_BUY,
+                type=POSITION_TYPE_BUY if is_buy else POSITION_TYPE_SELL,
                 volume=request.get("volume"),
                 price_open=request.get("price")
             )
             _positions.append(new_pos)
-            print(f"[Mock MT5] Position opened (filled from order): ticket={new_pos.ticket}, price_open={new_pos.price_open}")
+            print(f"[Mock MT5] Position opened (filled from order): ticket={new_pos.ticket}, price_open={new_pos.price_open}, type={'BUY' if is_buy else 'SELL'}")
         elif action == TRADE_ACTION_REMOVE:
             order_ticket = request.get("order")
             _orders = [o for o in _orders if o.ticket != order_ticket]

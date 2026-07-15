@@ -9,8 +9,16 @@ class TradingServer:
         self.app.post("/webhook")(self.webhook)
 
     async def webhook(self, data: dict):
-        self.state.update_zone(data["min"], data["max"])
-        return {"status": "received", "zone": [data["min"], data["max"]]}
+        direction = data.get("direction", "buy").lower()
+        if direction not in ["buy", "sell"]:
+            direction = "buy"
+        self.state.update_zone(data["min"], data["max"], direction)
+        return {
+            "status": "received",
+            "direction": direction,
+            "zone": [data["min"], data["max"]]
+        }
+
 
     def run(self):
         uvicorn.run(self.app, host="0.0.0.0", port=8000)
