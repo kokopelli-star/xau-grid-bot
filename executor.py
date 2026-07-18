@@ -39,6 +39,7 @@ class GridManager:
         is_buy = (self.state.direction == "buy")
         order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
 
+        success_count = 0
         for price in steps:
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
@@ -49,8 +50,18 @@ class GridManager:
                 "magic": 123456,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
-            mt5.order_send(request)
-        print(f"グリッド注文配置完了 ({'買い' if is_buy else '売り'}): {min_p} - {max_p}")
+            result = mt5.order_send(request)
+            if result is None:
+                print(f"注文送信失敗 (結果が返されませんでした): 価格 {round(price, 2)}")
+            elif result.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"注文送信失敗: 価格 {round(price, 2)}, retcode={result.retcode}")
+            else:
+                success_count += 1
+
+        if success_count == len(steps):
+            print(f"グリッド注文配置完了 ({'買い' if is_buy else '売り'}): {min_p} - {max_p}")
+        else:
+            print(f"グリッド注文配置完了（一部または全て失敗）: 成功 {success_count}/{len(steps)} ({'買い' if is_buy else '売り'}): {min_p} - {max_p}")
 
 
     def close_all_positions(self):
