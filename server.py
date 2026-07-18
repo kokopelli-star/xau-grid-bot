@@ -21,4 +21,4 @@ class TradingServer:
 
 
     def run(self):
-        uvicorn.run(self.app, host="0.0.0.0", port=8000)
+        uvicorn.run(self.app, host="0.0.0.0", port=8000, ws="none")
