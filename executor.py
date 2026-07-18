@@ -4,7 +4,7 @@ import time
 
 # --- 執行・監視クラス ---
 class GridManager:
-    def __init__(self, state, symbol="XAUUSD", volume=0.01, half_close_dist=10.0):
+    def __init__(self, state, symbol="XAUUSD", volume=0.02, half_close_dist=10.0):
         self.state = state
         self.symbol = symbol
         self.volume = volume
