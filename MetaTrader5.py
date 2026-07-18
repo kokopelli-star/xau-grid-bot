@@ -5,6 +5,9 @@ import platform
 # Windows環境ではインストールされている本物のMetaTrader5を使用し、
 # それ以外（macOSなど）ではダミーモックを使用するように動的に切り替えます。
 if platform.system() == "Windows":
+    # 循環インポートを防ぐため、sys.modulesから一時的に自身を退避
+    self_module = sys.modules.pop('MetaTrader5', None)
+
     this_dir = os.path.dirname(os.path.abspath(__file__))
     original_path = list(sys.path)
     sys.path = [p for p in sys.path if os.path.abspath(p) != this_dir]
@@ -16,6 +19,9 @@ if platform.system() == "Windows":
         raise
     finally:
         sys.path = original_path
+        # sys.modulesに自身を戻す
+        if self_module:
+            sys.modules['MetaTrader5'] = self_module
 else:
     import numpy as np
 
