@@ -4,12 +4,14 @@ import time
 
 # --- 執行・監視クラス ---
 class GridManager:
-    def __init__(self, state, symbol="XAUUSD", volume=0.01):
+    def __init__(self, state, symbol="XAUUSD", volume=0.01, half_close_dist=10.0):
         self.state = state
         self.symbol = symbol
         self.volume = volume
         self.atr_period = 14  # ATRの計算期間
         self.atr_multiplier = 0.5 # バッファ倍率（まずは0.5で設定）
+        self.half_close_dist = half_close_dist
+        self.half_close_done = False
 
     def get_atr(self):
         # 15分足のデータを取得 (期間+1本分)
@@ -150,12 +152,60 @@ class GridManager:
         else:
             print(f"最良ポジションの逆指値設定に失敗しました: ticket={best_pos.ticket}, retcode={result.retcode}")
 
+    def check_and_execute_half_close(self, current_price):
+        if self.half_close_done:
+            return
+
+        positions = mt5.positions_get(symbol=self.symbol)
+        if not positions:
+            return
+
+        is_buy = (self.state.direction == "buy")
+        
+        if is_buy:
+            best_pos = min(positions, key=lambda p: p.price_open)
+            profit_pips = current_price - best_pos.price_open
+        else:
+            best_pos = max(positions, key=lambda p: p.price_open)
+            profit_pips = best_pos.price_open - current_price
+
+        if profit_pips >= self.half_close_dist:
+            print(f"部分利確トリガー検知 (利益幅: {profit_pips:.2f} >= 設定幅: {self.half_close_dist})")
+            
+            for pos in positions:
+                half_vol = round(pos.volume / 2, 2)
+                if half_vol < 0.01:
+                    continue
+                
+                close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": self.symbol,
+                    "volume": half_vol,
+                    "type": close_type,
+                    "position": pos.ticket,
+                    "price": current_price,
+                    "deviation": 20,
+                    "magic": 123456,
+                    "comment": "grid half close",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+                result = mt5.order_send(request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"ポジション {pos.ticket} を半分決済しました (ロット: {pos.volume} -> {half_vol})")
+                else:
+                    print(f"半分決済失敗: ticket={pos.ticket}, retcode={result.retcode}")
+                    
+            self.half_close_done = True
 
     def run_executor(self):
         while True:
             if self.state.is_new_request:
                 self.close_all_positions()
                 self.place_grid_orders()
+                self.half_close_done = False
                 self.state.is_new_request = False
             time.sleep(1)
 
@@ -168,6 +218,7 @@ class GridManager:
 
                 if tick:
                     current_price = tick.bid
+                    self.check_and_execute_half_close(current_price)
                     atr = self.get_atr()
                     buffer = atr * self.atr_multiplier
                     is_buy = (self.state.direction == "buy")
