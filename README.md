@@ -42,6 +42,36 @@ py .\main.py
 
 ---
 
+## Discord通知の設定 (任意)
+
+新規にグリッド注文が配置された際、注文結果のサマリーと成否（OK/NG）の詳細をDiscordへ自動通知させることができます。
+
+### 1. Discord Webhook URL の取得
+1. 通知を受け取りたいDiscordサーバーのテキストチャンネルの「チャンネル編集」（歯車アイコン）を開きます。
+2. **「連携サービス」** メニューを選択し、**「ウェブフック」** をクリックします。
+3. **「新しいウェブフック」** を作成し、作成されたWebhookの設定から **「ウェブフックURLをコピー」** をクリックしてURLを取得します。
+
+### 2. 環境変数の設定と起動
+起動するシェルに合わせて、環境変数 `DISCORD_WEBHOOK_URL` を設定した上でボットを起動します。
+
+- **Windows (PowerShell)**:
+  ```powershell
+  $env:DISCORD_WEBHOOK_URL="取得したWebhook URL"
+  py .\main.py
+  ```
+- **Windows (コマンドプロンプト)**:
+  ```cmd
+  set DISCORD_WEBHOOK_URL=取得したWebhook URL
+  py .\main.py
+  ```
+- **macOS / Linux**:
+  ```bash
+  export DISCORD_WEBHOOK_URL="取得したWebhook URL"
+  arch -arm64 python3 main.py
+  ```
+
+---
+
 ## macOS環境での開発・テスト実行について
 
 公式の `MetaTrader5` ライブラリはWindows専用のため、macOS上では実際のMT5と連動させることはできません。
