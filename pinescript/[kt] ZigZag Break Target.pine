@@ -1,0 +1,172 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © katchinakt
+
+//@version=5
+indicator("[kt] ZigZag Break Target (Dual Logic + Labels)", overlay=true, max_boxes_count=100, max_lines_count=500, max_labels_count=100)
+// strategy("[kt] Zigzag Box Reversal Strategy", overlay=true, margin_long=100, margin_short=100, initial_capital=100000)
+
+// === パラメータ ===
+depth = input.int(8, "ZigZag Depth (left/right)", minval=1)
+retraceLo = input.float(0.38, "Retrace Low (38%)", step=0.01)
+retraceHi = input.float(0.62, "Retrace High (62%)", step=0.01)
+targetLo = input.float(1.38, "Target Low (138%)", step=0.01)
+targetHi = input.float(1.62, "Target High (162%)", step=0.01)
+boxBars = input.int(30, "Target Box Width (bars)", minval=1)
+maxKeep = input.int(100, "Max kept objects (lines/boxes/labels)", minval=10)
+
+// === Pivot ===
+ph = ta.pivothigh(high, depth, depth)
+pl = ta.pivotlow(low, depth, depth)
+
+// === スイング変数 ===
+var string prevType = ""
+var float  prevPrice = na
+var int    prevBar = na
+
+// --- ZigZagから受け取る仮想ボックス変数（初期化） ---
+var float tgtHigh = na
+var float tgtLow  = na
+var string curType = ""
+var float  curPrice = na
+var int    curBar = na
+
+var float baseRange = na
+
+// === 保持用配列 ===
+var line[] retraceLines = array.new_line()
+var box[]  boxes = array.new_box()
+var line[] baseLines = array.new_line()
+var label[] signals = array.new_label()
+
+// === Pivot 更新 ===
+if not na(ph)
+    prevType  := curType
+    prevPrice := curPrice
+    prevBar   := curBar
+    curType   := "high"
+    curPrice  := ph
+    curBar    := bar_index - depth
+
+if not na(pl)
+    prevType  := curType
+    prevPrice := curPrice
+    prevBar   := curBar
+    curType   := "low"
+    curPrice  := pl
+    curBar    := bar_index - depth
+
+// === オブジェクト削除関数 ===
+f_cleanup() =>
+    while array.size(retraceLines) > maxKeep
+        l = array.shift(retraceLines)
+        line.delete(l)
+    while array.size(baseLines) > maxKeep
+        l = array.shift(baseLines)
+        line.delete(l)
+    while array.size(boxes) > maxKeep
+        b = array.shift(boxes)
+        box.delete(b)
+    while array.size(signals) > maxKeep
+        lb = array.shift(signals)
+        label.delete(lb)
+
+// === Retrace 判定 ===
+var bool retraceActive = false
+var string retraceDir = ""
+var float baseHigh = na
+var float baseLow  = na
+var int baseHighBar = na
+var int baseLowBar  = na
+
+if (prevType != "") and (curType != "")
+    // --- Low → High（上昇波） ---
+    if (prevType == "low") and (curType == "high")
+        baseLow := prevPrice
+        baseHigh := curPrice
+        baseLowBar := prevBar
+        baseHighBar := curBar
+        baseRange := baseHigh - baseLow
+        if baseRange > 0
+            r = (baseHigh - close) / baseRange
+            if (r >= retraceLo) and (r <= retraceHi)
+                if not retraceActive
+                    retraceActive := true
+                    retraceDir := "long"
+                    l1 = line.new(baseLowBar, baseHigh - baseRange * retraceLo, baseLowBar + boxBars, baseHigh - baseRange * retraceLo, xloc=xloc.bar_index, color=color.new(color.blue,0), width=1)
+                    l2 = line.new(baseLowBar, baseHigh - baseRange * retraceHi, baseLowBar + boxBars, baseHigh - baseRange * retraceHi, xloc=xloc.bar_index, color=color.new(color.blue,0), width=1)
+                    array.push(retraceLines, l1)
+                    array.push(retraceLines, l2)
+
+    // --- High → Low（下降波） ---
+    if (prevType == "high") and (curType == "low")
+        baseHigh := prevPrice
+        baseLow  := curPrice
+        baseHighBar := prevBar
+        baseLowBar := curBar
+        baseRange := baseHigh - baseLow
+        if baseRange > 0
+            r = (close - baseLow) / baseRange
+            if (r >= retraceLo) and (r <= retraceHi)
+                if not retraceActive
+                    retraceActive := true
+                    retraceDir := "short"
+                    l1 = line.new(baseHighBar, baseLow + baseRange * retraceLo, baseHighBar + boxBars, baseLow + baseRange * retraceLo, xloc=xloc.bar_index, color=color.new(color.orange,0), width=1)
+                    l2 = line.new(baseHighBar, baseLow + baseRange * retraceHi, baseHighBar + boxBars, baseLow + baseRange * retraceHi, xloc=xloc.bar_index, color=color.new(color.orange,0), width=1)
+                    array.push(retraceLines, l1)
+                    array.push(retraceLines, l2)
+
+// === ブレイク判定 ===
+if retraceActive
+    if retraceDir == "long" and close > baseHigh
+        tgtLow := baseLow + baseRange * targetLo
+        tgtHigh := baseLow + baseRange * targetHi
+        b = box.new(left=bar_index, top=tgtHigh, right=bar_index + boxBars, bottom=tgtLow, bgcolor=color.new(color.red,80), border_color=color.new(color.red,40))
+        array.push(boxes, b)
+        bl = line.new(baseLowBar, baseLow, baseHighBar, baseHigh, xloc=xloc.bar_index, color=color.new(color.red,0), width=2)
+        array.push(baseLines, bl)
+        // lb = label.new(bar_index, tgtHigh, "BUY 138-162%", style=label.style_label_up, color=color.new(color.green,0), textcolor=color.white)
+        // array.push(signals, lb)
+        retraceActive := false
+        retraceDir := ""
+
+    if retraceDir == "short" and close < baseLow
+        tgtHigh := baseHigh - baseRange * targetLo
+        tgtLow  := baseHigh - baseRange * targetHi
+        b = box.new(left=bar_index, top=tgtHigh, right=bar_index + boxBars, bottom=tgtLow, bgcolor=color.new(color.aqua,80), border_color=color.new(color.aqua,40))
+        array.push(boxes, b)
+        bl = line.new(baseLowBar, baseLow, baseHighBar, baseHigh, xloc=xloc.bar_index, color=color.new(color.blue,0), width=2)
+        array.push(baseLines, bl)
+        // lb = label.new(bar_index, tgtLow, "SELL 138-162%", style=label.style_label_down, color=color.new(color.blue,0), textcolor=color.white)
+        // array.push(signals, lb)
+        retraceActive := false
+        retraceDir := ""
+
+// cleanup
+f_cleanup()
+
+// // === 戦略設定 ===
+
+// // === パラメータ ===
+// atrLen     = input.int(14, "ATR Length")
+// atrRiskMul = input.float(1.5, "ATR SL Multiplier")
+// tpMul      = input.float(1.0, "Take Profit x ATR")
+
+// atr = ta.atr(atrLen)
+
+// // === ボックス到達判定 ===
+// // 上昇ZigZag：上のボックス → ショート
+// longCondition  = (not na(tgtHigh)) and (close <= tgtHigh and close >= tgtLow) and (curType == "low")  // 下ZigZagの反転
+// shortCondition = (not na(tgtHigh)) and (close <= tgtHigh and close >= tgtLow) and (curType == "high") // 上ZigZagの反転
+
+// // === エントリー ===
+// if (longCondition) and (strategy.position_size == 0)
+//     sl = close - atr * atrRiskMul
+//     tp = close + atr * tpMul
+//     strategy.entry("LongReversal", strategy.long)
+//     strategy.exit("LongExit", "LongReversal", stop=sl, limit=tp)
+
+// if (shortCondition) and (strategy.position_size == 0)
+//     sl = close + atr * atrRiskMul
+//     tp = close - atr * tpMul
+//     strategy.entry("ShortReversal", strategy.short)
+//     strategy.exit("ShortExit", "ShortReversal", stop=sl, limit=tp)
