@@ -30,6 +30,33 @@ class GridManager:
         # ATR (単純移動平均)
         return np.mean(tr)
 
+    def send_discord_message(self, text):
+        import os
+        import urllib.request
+        import json
+
+        webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+        if not webhook_url:
+            print("[Warning] DISCORD_WEBHOOK_URL が設定されていないため、Discord通知をスキップします。")
+            return
+
+        payload = {"content": text}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        }
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req) as res:
+                pass
+        except Exception as e:
+            print(f"[Error] Discord通知の送信に失敗しました: {e}")
+
     def place_grid_orders(self):
         # ゾーン内に5つの指値を配置 (buy/sellに応じて注文タイプを変更)
         min_p = self.state.min_price
@@ -40,6 +67,7 @@ class GridManager:
         order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
 
         success_count = 0
+        details = []
         for price in steps:
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
@@ -52,16 +80,34 @@ class GridManager:
             }
             result = mt5.order_send(request)
             if result is None:
-                print(f"注文送信失敗 (結果が返されませんでした): 価格 {round(price, 2)}")
+                err_msg = f"注文送信失敗 (結果が返されませんでした): 価格 {round(price, 2)}"
+                print(err_msg)
+                details.append(f"❌ 価格 {round(price, 2)}: 失敗 (No Response)")
             elif result.retcode != mt5.TRADE_RETCODE_DONE:
-                print(f"注文送信失敗: 価格 {round(price, 2)}, retcode={result.retcode}")
+                err_msg = f"注文送信失敗: 価格 {round(price, 2)}, retcode={result.retcode}"
+                print(err_msg)
+                details.append(f"❌ 価格 {round(price, 2)}: 失敗 (retcode={result.retcode})")
             else:
                 success_count += 1
+                details.append(f"✅ 価格 {round(price, 2)}: 成功 (ticket={getattr(result, 'order', 'N/A')})")
 
+        direction_str = "買い (BUY)" if is_buy else "売り (SELL)"
         if success_count == len(steps):
-            print(f"グリッド注文配置完了 ({'買い' if is_buy else '売り'}): {min_p} - {max_p}")
+            summary = f"グリッド注文配置完了 ({direction_str}): {min_p} - {max_p}"
         else:
-            print(f"グリッド注文配置完了（一部または全て失敗）: 成功 {success_count}/{len(steps)} ({'買い' if is_buy else '売り'}): {min_p} - {max_p}")
+            summary = f"グリッド注文配置完了（一部または全て失敗）: 成功 {success_count}/{len(steps)} ({direction_str}): {min_p} - {max_p}"
+        
+        print(summary)
+
+        # Discord通知メッセージ構築
+        discord_text = (
+            f"🔔 **{self.symbol} グリッド注文結果**\n"
+            f"・方向: {direction_str}\n"
+            f"・ゾーン: {min_p} - {max_p}\n"
+            f"・結果: {summary}\n"
+            f"・詳細:\n" + "\n".join(details)
+        )
+        self.send_discord_message(discord_text)
 
 
     def close_all_positions(self):
