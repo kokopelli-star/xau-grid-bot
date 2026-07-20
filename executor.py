@@ -13,6 +13,7 @@ class GridManager:
         self.half_close_dist = half_close_dist
         self.half_close_done = False
         self.zone_entered = False
+        self.last_m1_time = None
 
     def get_atr(self):
         # 15分足のデータを取得 (期間+1本分)
@@ -311,6 +312,7 @@ class GridManager:
                 self.place_grid_orders()
                 self.half_close_done = False
                 self.zone_entered = False
+                self.last_m1_time = None
                 self.state.is_new_request = False
             time.sleep(1)
 
@@ -328,33 +330,57 @@ class GridManager:
                     buffer = atr * self.atr_multiplier
                     is_buy = (self.state.direction == "buy")
 
+                    # 1分足(M1)の確定判定
+                    m1_confirmed = False
+                    m1_close_price = current_price
+                    rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 0, 2)
+                    if rates is not None and len(rates) >= 2:
+                        latest_m1_time = rates[1]['time']
+                        if self.last_m1_time is None:
+                            # 初回取得時はタイムスタンプを保存するのみ
+                            self.last_m1_time = latest_m1_time
+                        elif latest_m1_time != self.last_m1_time:
+                            # タイムスタンプが切り替わったら確定とみなす
+                            m1_confirmed = True
+                            m1_close_price = rates[0]['close'] # 直前に確定した1分足の終値
+                            self.last_m1_time = latest_m1_time
+
                     # ゾーンへの進入判定
                     if not self.zone_entered:
                         if self.state.min_price <= current_price <= self.state.max_price:
                             self.zone_entered = True
                             print(f"価格がゾーン内に進入しました (Price: {current_price:.2f}, Range: {self.state.min_price:.2f} - {self.state.max_price:.2f})")
 
-                    # 1. 利確・損切り判定 (一度ゾーンに進入した、かつ監視中の場合のみ実行)
+                    # 1. 損切り判定 (一度ゾーンに進入した、かつ監視中の場合のみ、リアルタイム現在価格で実行)
                     if self.zone_entered:
                         if is_buy:
-                            # 買いグリッド：上限突破で「利確（バッファなし）」、下限割れで「損切り（バッファあり）」
-                            if current_price > self.state.max_price:
-                                print(f"ゾーン上限逸脱（買い利確）検知! (Price: {current_price}, TPライン: {self.state.max_price:.2f}, ATR: {atr:.2f})")
-                                self.handle_breakout_exit(is_buy=True)
-                                self.state.min_price = 0.0 # 監視終了
-                            elif current_price < (self.state.min_price - buffer):
+                            # 買いグリッドの損切り (下限割れ、バッファあり)
+                            if current_price < (self.state.min_price - buffer):
                                 print(f"ゾーン下限逸脱（買い損切り）検知! (Price: {current_price}, SLライン: {self.state.min_price - buffer:.2f}, ATR: {atr:.2f})")
                                 self.close_all_positions()
                                 self.state.min_price = 0.0 # 監視終了
+                                continue
                         else:
-                            # 売りグリッド：下限割れで「利確（バッファなし）」、上限突破で「損切り（バッファあり）」
-                            if current_price < self.state.min_price:
-                                print(f"ゾーン下限逸脱（売り利確）検知! (Price: {current_price}, TPライン: {self.state.min_price:.2f}, ATR: {atr:.2f})")
-                                self.handle_breakout_exit(is_buy=False)
-                                self.state.min_price = 0.0 # 監視終了
-                            elif current_price > (self.state.max_price + buffer):
+                            # 売りグリッドの損切り (上限突破、バッファあり)
+                            if current_price > (self.state.max_price + buffer):
                                 print(f"ゾーン上限逸脱（売り損切り）検知! (Price: {current_price}, SLライン: {self.state.max_price + buffer:.2f}, ATR: {atr:.2f})")
                                 self.close_all_positions()
+                                self.state.min_price = 0.0 # 監視終了
+                                continue
+
+                    # 2. 利確判定 (一度ゾーンに進入した、かつ監視中の場合のみ、1分足確定時の終値で実行)
+                    if self.zone_entered and m1_confirmed:
+                        if is_buy:
+                            # 買いグリッドの利確 (1分足終値が上限突破、バッファなし)
+                            if m1_close_price > self.state.max_price:
+                                print(f"1分足確定による利確検知（買い）! (M1終値: {m1_close_price:.2f}, TPライン: {self.state.max_price:.2f})")
+                                self.handle_breakout_exit(is_buy=True)
+                                self.state.min_price = 0.0 # 監視終了
+                        else:
+                            # 売りグリッドの利確 (1分足終値が下限割れ、バッファなし)
+                            if m1_close_price < self.state.min_price:
+                                print(f"1分足確定による利確検知（売り）! (M1終値: {m1_close_price:.2f}, TPライン: {self.state.min_price:.2f})")
+                                self.handle_breakout_exit(is_buy=False)
                                 self.state.min_price = 0.0 # 監視終了
 
             time.sleep(1)
