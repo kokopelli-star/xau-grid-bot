@@ -15,6 +15,19 @@ class GridManager:
         self.zone_entered = False
         self.last_m1_time = None
 
+    def get_filling_mode(self):
+        info = mt5.symbol_info(self.symbol)
+        if info is None:
+            return mt5.ORDER_FILLING_IOC # フォールバック
+        
+        filling_mode = info.filling_mode
+        if filling_mode & mt5.SYMBOL_FILLING_FOK:
+            return mt5.ORDER_FILLING_FOK
+        elif filling_mode & mt5.SYMBOL_FILLING_IOC:
+            return mt5.ORDER_FILLING_IOC
+        else:
+            return mt5.ORDER_FILLING_RETURN
+
     def get_atr(self):
         # 15分足のデータを取得 (期間+1本分)
         rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M15, 0, self.atr_period + 1)
@@ -101,7 +114,7 @@ class GridManager:
                 "type": order_type,
                 "price": price_r,
                 "magic": 123456,
-                "type_filling": mt5.ORDER_FILLING_IOC,
+                "type_filling": self.get_filling_mode(),
             }
             result = mt5.order_send(request)
             if result is None:
@@ -162,7 +175,7 @@ class GridManager:
                     "magic": 123456,
                     "comment": "grid close all",
                     "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_filling": self.get_filling_mode(),
                 }
                 result = mt5.order_send(request)
                 if result.retcode != mt5.TRADE_RETCODE_DONE:
@@ -235,7 +248,7 @@ class GridManager:
                 "magic": 123456,
                 "comment": "grid profit exit",
                 "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
+                "type_filling": self.get_filling_mode(),
             }
             result = mt5.order_send(request)
             if result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -335,7 +348,7 @@ class GridManager:
                     "magic": 123456,
                     "comment": "grid half close",
                     "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_filling": self.get_filling_mode(),
                 }
                 result = mt5.order_send(request)
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
