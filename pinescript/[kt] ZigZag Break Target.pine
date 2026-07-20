@@ -116,7 +116,7 @@ if (prevType != "") and (curType != "")
                     array.push(retraceLines, l2)
 
 // === ブレイク判定 ===
-if retraceActive
+if retraceActive and barstate.isconfirmed
     if retraceDir == "long" and close > baseHigh
         tgtLow := baseLow + baseRange * targetLo
         tgtHigh := baseLow + baseRange * targetHi
@@ -127,10 +127,9 @@ if retraceActive
         // lb = label.new(bar_index, tgtHigh, "BUY 138-162%", style=label.style_label_up, color=color.new(color.green,0), textcolor=color.white)
         // array.push(signals, lb)
         
-        // Webhook用アラート送信（バー確定時に1回のみ実行）
-        if barstate.isconfirmed
-            alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "buy"}'
-            alert(alert_msg, alert.freq_once_per_bar_close)
+        // Webhook用アラート送信
+        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "buy"}'
+        alert(alert_msg, alert.freq_once_per_bar_close)
 
         retraceActive := false
         retraceDir := ""
@@ -145,10 +144,9 @@ if retraceActive
         // lb = label.new(bar_index, tgtLow, "SELL 138-162%", style=label.style_label_down, color=color.new(color.blue,0), textcolor=color.white)
         // array.push(signals, lb)
         
-        // Webhook用アラート送信（バー確定時に1回のみ実行）
-        if barstate.isconfirmed
-            alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "sell"}'
-            alert(alert_msg, alert.freq_once_per_bar_close)
+        // Webhook用アラート送信
+        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "sell"}'
+        alert(alert_msg, alert.freq_once_per_bar_close)
 
         retraceActive := false
         retraceDir := ""

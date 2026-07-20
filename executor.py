@@ -58,40 +58,62 @@ class GridManager:
             print(f"[Error] Discord通知の送信に失敗しました: {e}")
 
     def place_grid_orders(self):
-        # ゾーン内に5つの指値を配置 (buy/sellに応じて注文タイプを変更)
+        # ゾーン内に5つの指値を配置 (現在価格との位置関係に応じてLIMIT/STOPを動的に切り替え)
         min_p = self.state.min_price
         max_p = self.state.max_price
         steps = [min_p + (max_p - min_p) * i / 4 for i in range(5)]
 
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            err_msg = f"❌ [Error] ティック情報の取得に失敗したため、グリッド注文を配置できませんでした"
+            print(err_msg)
+            self.send_discord_message(f"🔔 **{self.symbol} グリッド注文結果**\n{err_msg}")
+            return
+
         is_buy = (self.state.direction == "buy")
-        order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
+        direction_str = "買い (BUY)" if is_buy else "売り (SELL)"
 
         success_count = 0
         details = []
         for price in steps:
+            price_r = round(price, 2)
+            if is_buy:
+                if price_r < tick.ask:
+                    order_type = mt5.ORDER_TYPE_BUY_LIMIT
+                    order_type_str = "BUY LIMIT"
+                else:
+                    order_type = mt5.ORDER_TYPE_BUY_STOP
+                    order_type_str = "BUY STOP"
+            else:
+                if price_r > tick.bid:
+                    order_type = mt5.ORDER_TYPE_SELL_LIMIT
+                    order_type_str = "SELL LIMIT"
+                else:
+                    order_type = mt5.ORDER_TYPE_SELL_STOP
+                    order_type_str = "SELL STOP"
+
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": self.symbol,
                 "volume": self.volume,
                 "type": order_type,
-                "price": round(price, 2),
+                "price": price_r,
                 "magic": 123456,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
             result = mt5.order_send(request)
             if result is None:
-                err_msg = f"注文送信失敗 (結果が返されませんでした): 価格 {round(price, 2)}"
+                err_msg = f"注文送信失敗 (結果が返されませんでした): 価格 {price_r} ({order_type_str})"
                 print(err_msg)
-                details.append(f"❌ 価格 {round(price, 2)}: 失敗 (No Response)")
+                details.append(f"❌ 価格 {price_r} ({order_type_str}): 失敗 (No Response)")
             elif result.retcode != mt5.TRADE_RETCODE_DONE:
-                err_msg = f"注文送信失敗: 価格 {round(price, 2)}, retcode={result.retcode}"
+                err_msg = f"注文送信失敗: 価格 {price_r} ({order_type_str}), retcode={result.retcode}"
                 print(err_msg)
-                details.append(f"❌ 価格 {round(price, 2)}: 失敗 (retcode={result.retcode})")
+                details.append(f"❌ 価格 {price_r} ({order_type_str}): 失敗 (retcode={result.retcode})")
             else:
                 success_count += 1
-                details.append(f"✅ 価格 {round(price, 2)}: 成功 (ticket={getattr(result, 'order', 'N/A')})")
+                details.append(f"✅ 価格 {price_r} ({order_type_str}): 成功 (ticket={getattr(result, 'order', 'N/A')})")
 
-        direction_str = "買い (BUY)" if is_buy else "売り (SELL)"
         if success_count == len(steps):
             summary = f"グリッド注文配置完了 ({direction_str}): {min_p} - {max_p}"
         else:
@@ -104,6 +126,7 @@ class GridManager:
             f"🔔 **{self.symbol} グリッド注文結果**\n"
             f"・方向: {direction_str}\n"
             f"・ゾーン: {min_p} - {max_p}\n"
+            f"・現在価格: Ask={tick.ask:.2f}, Bid={tick.bid:.2f}\n"
             f"・結果: {summary}\n"
             f"・詳細:\n" + "\n".join(details)
         )
