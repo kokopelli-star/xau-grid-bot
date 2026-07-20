@@ -303,29 +303,27 @@ class GridManager:
                     buffer = atr * self.atr_multiplier
                     is_buy = (self.state.direction == "buy")
 
-                    # 1. ゾーン下限の逸脱判定
-                    if current_price < (self.state.min_price - buffer):
-                        if is_buy:
-                            # 買いグリッドの場合：下限割れは「損切り」
-                            print(f"ゾーン下限逸脱（買い損切り）検知! (Price: {current_price}, ATR: {atr:.2f})")
-                            self.close_all_positions()
-                        else:
-                            # 売りグリッドの場合：下限割れは「利確」
-                            print(f"ゾーン下限逸脱（売り利確）検知! (Price: {current_price}, ATR: {atr:.2f})")
-                            self.handle_breakout_exit(is_buy=False)
-                        self.state.min_price = 0.0 # 監視終了
-                    
-                    # 2. ゾーン上限の逸脱判定
-                    elif current_price > (self.state.max_price + buffer):
-                        if is_buy:
-                            # 買いグリッドの場合：上限突破は「利確」
-                            print(f"ゾーン上限逸脱（買い利確）検知! (Price: {current_price}, ATR: {atr:.2f})")
+                    # 1. 利確・損切り判定 (買いと売りで個別に処理し、利確時はバッファなし、損切り時はバッファあり)
+                    if is_buy:
+                        # 買いグリッド：上限突破で「利確（バッファなし）」、下限割れで「損切り（バッファあり）」
+                        if current_price > self.state.max_price:
+                            print(f"ゾーン上限逸脱（買い利確）検知! (Price: {current_price}, TPライン: {self.state.max_price:.2f}, ATR: {atr:.2f})")
                             self.handle_breakout_exit(is_buy=True)
-                        else:
-                            # 売りグリッドの場合：上限突破は「損切り」
-                            print(f"ゾーン上限逸脱（売り損切り）検知! (Price: {current_price}, ATR: {atr:.2f})")
+                            self.state.min_price = 0.0 # 監視終了
+                        elif current_price < (self.state.min_price - buffer):
+                            print(f"ゾーン下限逸脱（買い損切り）検知! (Price: {current_price}, SLライン: {self.state.min_price - buffer:.2f}, ATR: {atr:.2f})")
                             self.close_all_positions()
-                        self.state.min_price = 0.0 # 監視終了
+                            self.state.min_price = 0.0 # 監視終了
+                    else:
+                        # 売りグリッド：下限割れで「利確（バッファなし）」、上限突破で「損切り（バッファあり）」
+                        if current_price < self.state.min_price:
+                            print(f"ゾーン下限逸脱（売り利確）検知! (Price: {current_price}, TPライン: {self.state.min_price:.2f}, ATR: {atr:.2f})")
+                            self.handle_breakout_exit(is_buy=False)
+                            self.state.min_price = 0.0 # 監視終了
+                        elif current_price > (self.state.max_price + buffer):
+                            print(f"ゾーン上限逸脱（売り損切り）検知! (Price: {current_price}, SLライン: {self.state.max_price + buffer:.2f}, ATR: {atr:.2f})")
+                            self.close_all_positions()
+                            self.state.min_price = 0.0 # 監視終了
 
             time.sleep(1)
 
