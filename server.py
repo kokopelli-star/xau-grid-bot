@@ -9,6 +9,7 @@ class TradingServer:
         self.app.post("/webhook")(self.webhook)
 
     async def webhook(self, data: dict):
+        print(f"[Webhook Received] POST data: {data}")
         direction = data.get("direction", "buy").lower()
         if direction not in ["buy", "sell"]:
             direction = "buy"

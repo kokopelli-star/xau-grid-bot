@@ -58,7 +58,7 @@ class GridManager:
             print(f"[Error] Discord通知の送信に失敗しました: {e}")
 
     def place_grid_orders(self):
-        # ゾーン内に5つの指値を配置 (STOP注文が必要な場合はエラーとして処理を中止)
+        # ゾーン内に5つの指値を配置 (現在価格との位置関係に応じてLIMIT/STOPを動的に切り替え)
         min_p = self.state.min_price
         max_p = self.state.max_price
         steps = [min_p + (max_p - min_p) * i / 4 for i in range(5)]
@@ -73,40 +73,25 @@ class GridManager:
         is_buy = (self.state.direction == "buy")
         direction_str = "買い (BUY)" if is_buy else "売り (SELL)"
 
-        # STOP注文（逆指値）の発生有無を事前チェック
-        has_stop_order = False
-        invalid_prices = []
-        for price in steps:
-            price_r = round(price, 2)
-            if is_buy:
-                # 買いの場合、グリッド価格が現在のAsk以上であればBUY_STOPが必要になるためエラー
-                if price_r >= tick.ask:
-                    has_stop_order = True
-                    invalid_prices.append(f"{price_r} (>= Ask: {tick.ask})")
-            else:
-                # 売りの場合、グリッド価格が現在のBid以下であればSELL_STOPが必要になるためエラー
-                if price_r <= tick.bid:
-                    has_stop_order = True
-                    invalid_prices.append(f"{price_r} (<= Bid: {tick.bid})")
-
-        if has_stop_order:
-            err_msg = (
-                f"❌ [Error] 逆指値（STOP）注文が必要な価格が含まれているため、発注を中止しました。\n"
-                f"・方向: {direction_str}\n"
-                f"・現在価格: Ask={tick.ask:.2f}, Bid={tick.bid:.2f}\n"
-                f"・対象外の価格: {', '.join(invalid_prices)}"
-            )
-            print(err_msg)
-            self.send_discord_message(f"🔔 **{self.symbol} グリッド注文エラー**\n{err_msg}")
-            return
-
-        order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
-        order_type_str = "BUY LIMIT" if is_buy else "SELL LIMIT"
-
         success_count = 0
         details = []
         for price in steps:
             price_r = round(price, 2)
+            if is_buy:
+                if price_r < tick.ask:
+                    order_type = mt5.ORDER_TYPE_BUY_LIMIT
+                    order_type_str = "BUY LIMIT"
+                else:
+                    order_type = mt5.ORDER_TYPE_BUY_STOP
+                    order_type_str = "BUY STOP"
+            else:
+                if price_r > tick.bid:
+                    order_type = mt5.ORDER_TYPE_SELL_LIMIT
+                    order_type_str = "SELL LIMIT"
+                else:
+                    order_type = mt5.ORDER_TYPE_SELL_STOP
+                    order_type_str = "SELL STOP"
+
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": self.symbol,
