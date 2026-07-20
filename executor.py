@@ -166,7 +166,30 @@ class GridManager:
                 result = mt5.order_send(request)
                 if result.retcode != mt5.TRADE_RETCODE_DONE:
                     print(f"ポジションクローズ失敗: ticket={pos.ticket}, retcode={result.retcode}")
-        print("全ポジション・注文をクリアしました")
+        
+        # 決済完了を同期的に待機する（最大5秒）
+        print("ポジションの完全決済を待機中...")
+        start_time = time.time()
+        while time.time() - start_time < 5.0:
+            remaining_positions = mt5.positions_get(symbol=self.symbol)
+            if not remaining_positions:
+                print("すべてのポジションの決済完了を確認しました。")
+                break
+            time.sleep(0.1)
+        else:
+            # タイムアウト時に対象ポジションが残っていた場合
+            remaining_positions = mt5.positions_get(symbol=self.symbol)
+            if remaining_positions:
+                tickets = [str(pos.ticket) for pos in remaining_positions]
+                err_msg = (
+                    f"⚠️ **[{self.symbol}] ポジションクローズタイムアウト**\n"
+                    f"一部のポジションが正常にクローズされませんでした。手動で確認してください。\n"
+                    f"・残存チケット: {', '.join(tickets)}"
+                )
+                print(f"[Error] {err_msg}")
+                self.send_discord_message(err_msg)
+
+        print("全ポジション・注文のクリア処理が完了しました")
 
     def handle_breakout_exit(self, is_buy):
         # 1. 未約定の注文（指値）を全てキャンセル
