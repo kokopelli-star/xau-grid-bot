@@ -21,9 +21,12 @@ class GridManager:
             return mt5.ORDER_FILLING_IOC # フォールバック
         
         filling_mode = info.filling_mode
-        if filling_mode & mt5.SYMBOL_FILLING_FOK:
+        # Python の MetaTrader5 モジュールには SYMBOL_FILLING_* 定数が定義されていないため、直接整数値で判定
+        # 1: SYMBOL_FILLING_FOK
+        # 2: SYMBOL_FILLING_IOC
+        if filling_mode & 1:
             return mt5.ORDER_FILLING_FOK
-        elif filling_mode & mt5.SYMBOL_FILLING_IOC:
+        elif filling_mode & 2:
             return mt5.ORDER_FILLING_IOC
         else:
             return mt5.ORDER_FILLING_RETURN
