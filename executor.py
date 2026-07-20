@@ -244,18 +244,58 @@ class GridManager:
                 print(f"ポジションクローズ失敗: ticket={pos.ticket}, retcode={result.retcode}")
 
         # 5. 残した最良ポジションのストップロス（SL）を建値に変更してリスクフリーにする
-        sl_request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": best_pos.ticket,
-            "symbol": self.symbol,
-            "sl": round(best_pos.price_open, 2),  # 建値に変更
-            "tp": 0.0                             # 0.0 はTPなし
-        }
-        result = mt5.order_send(sl_request)
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"最良ポジション {best_pos.ticket} の逆指値(SL)を建値 {best_pos.price_open} に設定しました (リスクフリー化完了)")
+        # 他ポジションの決済処理がMT5サーバー側で反映されるのを少し待つ
+        time.sleep(0.5)
+        updated_positions = mt5.positions_get(symbol=self.symbol)
+        if not updated_positions:
+            print("最良ポジションが見つかりません（既に決済された可能性があります）")
+            return
+
+        best_pos_updated = next((p for p in updated_positions if p.ticket == best_pos.ticket), None)
+        if best_pos_updated is None:
+            print(f"最良ポジション (ticket={best_pos.ticket}) の再取得に失敗しました")
+            return
+
+        tick = mt5.symbol_info_tick(self.symbol)
+        sym_info = mt5.symbol_info(self.symbol)
+        if tick is None or sym_info is None:
+            print("シンボル情報またはティック情報の取得に失敗したため、SL変更をスキップします")
+            return
+
+        stops_level = sym_info.trade_stops_level * sym_info.point
+        target_sl = round(best_pos_updated.price_open, 2)
+
+        is_sl_valid = False
+        if is_buy:
+            # 買い: SL <= Bid - StopsLevel
+            max_allowed_sl = tick.bid - stops_level
+            if target_sl <= max_allowed_sl:
+                is_sl_valid = True
+            else:
+                print(f"ストップレベル違反のため建値SLを設定できません。建値: {target_sl:.2f}, 設定可能最大値: {max_allowed_sl:.2f} (Bid: {tick.bid:.2f}, StopsLevel: {stops_level:.4f})")
         else:
-            print(f"最良ポジションの逆指値設定に失敗しました: ticket={best_pos.ticket}, retcode={result.retcode}")
+            # 売り: SL >= Ask + StopsLevel
+            min_allowed_sl = tick.ask + stops_level
+            if target_sl >= min_allowed_sl:
+                is_sl_valid = True
+            else:
+                print(f"ストップレベル違反のため建値SLを設定できません。建値: {target_sl:.2f}, 設定可能最小値: {min_allowed_sl:.2f} (Ask: {tick.ask:.2f}, StopsLevel: {stops_level:.4f})")
+
+        if is_sl_valid:
+            sl_request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": best_pos_updated.ticket,
+                "symbol": self.symbol,
+                "sl": target_sl,
+                "tp": best_pos_updated.tp  # 既存のTPを維持
+            }
+            result = mt5.order_send(sl_request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"最良ポジション {best_pos_updated.ticket} の逆指値(SL)を建値 {target_sl:.2f} に設定しました (リスクフリー化完了)")
+            else:
+                print(f"最良ポジションの逆指値設定に失敗しました: ticket={best_pos_updated.ticket}, retcode={result.retcode}")
+        else:
+            print("リスクフリーSLの設定をスキップします。")
 
     def check_and_execute_half_close(self, current_price):
         if self.half_close_done:
