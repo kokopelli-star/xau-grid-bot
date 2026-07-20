@@ -128,7 +128,7 @@ if retraceActive and barstate.isconfirmed
         // array.push(signals, lb)
         
         // Webhook用アラート送信
-        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "buy"}'
+        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "sell"}'
         alert(alert_msg, alert.freq_once_per_bar_close)
 
         retraceActive := false
@@ -145,7 +145,7 @@ if retraceActive and barstate.isconfirmed
         // array.push(signals, lb)
         
         // Webhook用アラート送信
-        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "sell"}'
+        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "buy"}'
         alert(alert_msg, alert.freq_once_per_bar_close)
 
         retraceActive := false
