@@ -1,0 +1,450 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © katchinakt
+//
+// ============================================================================
+// [kt] ZigZag Break Target v2 — Continuation Strategy（ドテン単体）
+// ----------------------------------------------------------------------------
+// 「[kt] ZigZag Break Target v2 Strategy.pine」の検証で、利益のほぼ全てが
+// 逆張り(BASE)ではなくドテン(REV)から出ていることが分かったため、
+// 逆張りエントリーを完全に外し、ブレイク方向への継続トレードだけを取り出したもの。
+//
+//   15m/6ヶ月の実測（htf=off）
+//     BASE(逆張り) 35件 PF1.14 期待値0.123R  純損益 +560   ← 全体の5%
+//     REV(ドテン)  26件 PF2.96 期待値1.366R  純損益 +10,348
+//
+// touch方式では 138〜162% の指値が 190% より必ず先に約定するため、逆張りを
+// 外してもドテンの発動タイミングは1件も変わらない。つまり本ファイルは
+// 「35件の逆張りトレードとそのコストを捨てて、26件のドテンだけを取る」もの。
+//
+// ロジック:
+//   1) ZigZag で直近の波（安値→高値 or 高値→安値）を測る
+//   2) 波の 38〜62% まで押し／戻しが入るのを待つ（requireRetrace）
+//   3) 波の起点方向へブレイク（終値が波の端を更新）
+//   4) ブレイク方向に、起点から entryExt(既定190%) の逆指値を置く
+//   5) SL は slExt(既定138%)、TP は tpExt(既定261.8%)
+//
+// ※ このロジックは「1バー以内で決着する」トレードの比率が高い。
+//    バックテストの約定は足内の値動き順序の仮定に依存するため、
+//    必ず Bar Magnifier を有効にして検証すること（下部の検証メモ参照）。
+// ============================================================================
+
+//@version=5
+strategy("[kt] ZigZag Break Target v2 Continuation", overlay=true, pyramiding=0, initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.0, slippage=0, max_boxes_count=500, max_lines_count=500, max_labels_count=500, calc_on_order_fills=false, process_orders_on_close=true)
+
+// ============================================================================
+// === 入力パラメータ ===
+// ============================================================================
+grpTest = "0. 検証期間 (IS/OOS 分割用)"
+useRange = input.bool(false, "期間を限定する", group=grpTest)
+startTs  = input.time(timestamp("01 Jan 2020 00:00 +0000"), "  開始", group=grpTest)
+endTs    = input.time(timestamp("01 Jan 2030 00:00 +0000"), "  終了", group=grpTest)
+
+grpRisk = "0b. サイジング"
+qtyMode = input.string("fixed", "ロット計算", options=["fixed", "risk"], group=grpRisk, tooltip="fixed = 固定数量（シグナル性能を素で見るときはこちら）。risk = 資金の一定%をSL幅で割って算出。")
+fixedQty= input.float(5.0, "  固定数量", minval=0.0, step=0.1, group=grpRisk)
+riskPct = input.float(1.0, "  リスク % / trade", minval=0.01, step=0.1, group=grpRisk)
+maxLev  = input.float(10.0, "  レバレッジ上限 (0=無効)", minval=0, step=1, group=grpRisk)
+minStopMode = input.string("skip", "最小SL距離のガード", options=["skip", "widen", "off"], group=grpRisk, tooltip="skip = SL幅が下限未満のシグナルを見送る / widen = SLを下限まで広げる / off = 無効")
+minStopAtr  = input.float(1.0, "  最小SL距離 (× ATR)", minval=0, step=0.1, group=grpRisk)
+minStopAbs  = input.float(0.0, "  最小SL距離 (価格, 0=無効)", minval=0, step=0.01, group=grpRisk)
+maxHold = input.int(0, "最大保有バー数 (0=無効)", minval=0, group=grpRisk)
+
+grpZZ = "1. ZigZag / 波"
+depth       = input.int(8,     "ZigZag Depth (left/right)", minval=1, group=grpZZ)
+minRangeAtr = input.float(0.0, "波の最小サイズ (× ATR, 0=無効)", minval=0, step=0.1, group=grpZZ)
+showZZ      = input.bool(true, "ZigZag ラインを描画", group=grpZZ)
+
+grpSetup = "2. セットアップ（押し目→ブレイク）"
+requireRetrace = input.bool(true, "押し／戻しを必須にする", group=grpSetup, tooltip="OFFにすると波が確定した時点で待機状態に入り、押し目を待たずにブレイクを狙います。トレード数は増えますが質は落ちる可能性があります。")
+retraceLo  = input.float(0.38, "  Retrace Low (38%)",  step=0.01, group=grpSetup)
+retraceHi  = input.float(0.62, "  Retrace High (62%)", step=0.01, group=grpSetup)
+maxWaitBars= input.int(60, "ブレイク待ちの上限 (bars)", minval=1, group=grpSetup)
+cancelLevel= input.float(1.00, "待機キャンセルの戻し率 (0=無効)", minval=0, step=0.01, group=grpSetup, tooltip="1.00 なら起点割れで待機を解除。")
+
+grpExec = "3. 執行水準（起点からの拡張率）"
+entryExt = input.float(1.90, "エントリー (190%)", step=0.01, group=grpExec, tooltip="ブレイク方向にこの水準の逆指値を置きます。逆張り版のSL水準に相当し、『逆張りが失敗した位置』です。")
+slExtIn  = input.float(1.38, "  損切り (138%)", step=0.01, group=grpExec, tooltip="ゾーンの手前側に戻されたらブレイク失敗とみなします。")
+tpExtIn  = input.float(2.618, "  利確 (261.8%)", step=0.01, group=grpExec)
+orderValidBars = input.int(30, "逆指値の有効期限 (bars)", minval=1, group=grpExec)
+useCancelStale = input.bool(true, "深い戻しで注文を取り消す", group=grpExec)
+staleLevel     = input.float(0.618, "  取消水準 (波の戻し率)", minval=0.0, maxval=0.99, step=0.01, group=grpExec)
+skipIfPassed   = input.bool(true, "ブレイク足が既にエントリー水準を超えていたら見送る", group=grpExec, tooltip="OFFにすると次足始値で成行約定します（追いかけ買い）。")
+minRR          = input.float(0.0, "最小 RR (0=無効)", minval=0, step=0.1, group=grpExec)
+
+grpFilter = "4. フィルタ"
+htfMode    = input.string("off", "上位足トレンドフィルタ", options=["off", "align", "align_strict"], group=grpFilter, tooltip="発注方向（＝ブレイク方向）が上位足トレンドと同じときのみ許可。継続トレードなので方向は一致させます。\n※逆張り版の align はBASEの方向で判定していたため、ドテンには逆向きに効いていました。")
+htfTf      = input.timeframe("240", "  上位足", group=grpFilter)
+htfLen     = input.int(50,   "  上位足 EMA 期間", minval=1, group=grpFilter)
+atrLen     = input.int(14,   "ATR 期間", minval=1, group=grpFilter)
+maxAtrPct  = input.float(0.0, "ATR/価格 の上限 (%, 0=無効)", minval=0, step=0.05, group=grpFilter)
+useSess    = input.bool(false, "取引セッションを限定", group=grpFilter)
+sessSpec   = input.session("0000-2400", "  許可セッション", group=grpFilter)
+exSessOn   = input.bool(false, "除外セッションを使う", group=grpFilter)
+exSessSpec = input.session("2130-2300", "  除外セッション", group=grpFilter)
+tzIn       = input.string("", "  タイムゾーン (空欄=取引所)", group=grpFilter)
+
+grpDraw = "5. 描画"
+drawBars  = input.int(30,  "描画の長さ (bars)", minval=1, group=grpDraw)
+maxKeep   = input.int(100, "Max kept objects", minval=10, group=grpDraw)
+showPanel = input.bool(true, "ステータスパネルを表示", group=grpDraw)
+
+// ============================================================================
+// === 共通ヘルパー ===
+// ============================================================================
+f_p(float x) => na(x) ? "null" : str.tostring(x, format.mintick)
+f_r(float x) => na(x) ? "null" : str.tostring(x, "#.###")
+
+f_row(table t, int row, string k, string v) =>
+    table.cell(t, 0, row, k, text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.black, 80), text_halign=text.align_left)
+    table.cell(t, 1, row, v, text_color=color.white, text_size=size.small, bgcolor=color.new(color.black, 80), text_halign=text.align_right)
+
+atr    = ta.atr(atrLen)
+inDate = not useRange or (time >= startTs and time <= endTs)
+
+// 水準の整合性。entry は SL より外、TP は entry より外でなければ成立しない。
+levelsOk = tpExtIn > entryExt and entryExt > slExtIn
+
+minStopDist = minStopMode == "off" ? 0.0 : math.max(na(atr) ? 0.0 : atr * minStopAtr, minStopAbs)
+
+f_qty(float px, float stopPx) =>
+    d     = math.max(math.abs(px - stopPx), syminfo.mintick)
+    qRisk = strategy.equity * riskPct / 100.0 / d
+    qCap  = maxLev <= 0 ? qRisk : strategy.equity * maxLev / math.max(px, syminfo.mintick)
+    qtyMode == "fixed" ? fixedQty : math.min(qRisk, qCap)
+
+// --- 上位足トレンド（確定値のみ参照＝非リペイント） ---
+htfOk = timeframe.in_seconds(htfTf) >= timeframe.in_seconds(timeframe.period)
+[htfClose, htfEma] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, htfLen)[1]], lookahead=barmerge.lookahead_off)
+htfTrend = not htfOk or na(htfEma) ? 0 : htfClose > htfEma ? 1 : htfClose < htfEma ? -1 : 0
+
+tzUse    = tzIn == "" ? syminfo.timezone : tzIn
+inSess   = not useSess or not na(time(timeframe.period, sessSpec, tzUse))
+inExSess = exSessOn and not na(time(timeframe.period, exSessSpec, tzUse))
+sessOk   = inSess and not inExSess
+
+// ============================================================================
+// === 保持用配列 / クリーンアップ ===
+// ============================================================================
+var line[]  levelLines = array.new_line()
+var line[]  zzLines    = array.new_line()
+var box[]   boxes      = array.new_box()
+var label[] signals    = array.new_label()
+
+f_cleanup() =>
+    while array.size(levelLines) > maxKeep
+        line.delete(array.shift(levelLines))
+    while array.size(zzLines) > maxKeep
+        line.delete(array.shift(zzLines))
+    while array.size(boxes) > maxKeep
+        box.delete(array.shift(boxes))
+    while array.size(signals) > maxKeep
+        label.delete(array.shift(signals))
+
+// ============================================================================
+// === ZigZag コア（逆張り版と同一。同種連続の上書き / 同一足同時発生の順序） ===
+// ============================================================================
+phRaw  = ta.pivothigh(high, depth, depth)
+plRaw  = ta.pivotlow(low,  depth, depth)
+pvtBar = bar_index - depth
+
+var string curType   = ""
+var float  curPrice  = na
+var int    curBar    = na
+var string prevType  = ""
+var float  prevPrice = na
+var int    prevBar   = na
+var int    waveId    = 0
+
+bool didShift  = false
+bool didUpdate = false
+
+bothPvt  = not na(phRaw) and not na(plRaw)
+lowFirst = bothPvt and curType == "high"
+
+string s1Type = ""
+float  s1Price = na
+string s2Type = ""
+float  s2Price = na
+
+if bothPvt
+    s1Type  := lowFirst ? "low"  : "high"
+    s1Price := lowFirst ? plRaw  : phRaw
+    s2Type  := lowFirst ? "high" : "low"
+    s2Price := lowFirst ? phRaw  : plRaw
+else if not na(phRaw)
+    s1Type  := "high"
+    s1Price := phRaw
+else if not na(plRaw)
+    s1Type  := "low"
+    s1Price := plRaw
+
+if s1Type != ""
+    if s1Type == curType
+        if (s1Type == "high" and s1Price > curPrice) or (s1Type == "low" and s1Price < curPrice)
+            curPrice  := s1Price
+            curBar    := pvtBar
+            waveId    += 1
+            didUpdate := true
+    else
+        prevType  := curType
+        prevPrice := curPrice
+        prevBar   := curBar
+        curType   := s1Type
+        curPrice  := s1Price
+        curBar    := pvtBar
+        waveId    += 1
+        didShift  := true
+
+if s2Type != ""
+    if s2Type == curType
+        if (s2Type == "high" and s2Price > curPrice) or (s2Type == "low" and s2Price < curPrice)
+            curPrice  := s2Price
+            curBar    := pvtBar
+            waveId    += 1
+            didUpdate := true
+    else
+        prevType  := curType
+        prevPrice := curPrice
+        prevBar   := curBar
+        curType   := s2Type
+        curPrice  := s2Price
+        curBar    := pvtBar
+        waveId    += 1
+        didShift  := true
+
+var line zzLine = na
+if showZZ and didShift and not na(prevBar) and not na(prevPrice)
+    zzLine := line.new(prevBar, prevPrice, curBar, curPrice, xloc=xloc.bar_index, color=color.new(color.gray, 30), width=1)
+    array.push(zzLines, zzLine)
+else if showZZ and didUpdate and not na(zzLine)
+    line.set_xy2(zzLine, curBar, curPrice)
+
+waveDir     = prevType == "low" and curType == "high" ? "up" : prevType == "high" and curType == "low" ? "down" : ""
+waveHigh    = waveDir == "up" ? curPrice : waveDir == "down" ? prevPrice : na
+waveLow     = waveDir == "up" ? prevPrice : waveDir == "down" ? curPrice : na
+waveHighBar = waveDir == "up" ? curBar   : waveDir == "down" ? prevBar  : na
+waveLowBar  = waveDir == "up" ? prevBar  : waveDir == "down" ? curBar   : na
+waveRange   = waveHigh - waveLow
+
+// ============================================================================
+// === セットアップ待機（押し目→ブレイク待ち） ===
+// ============================================================================
+var bool   armed      = false
+var string sigDir     = ""     // 波の方向 "up" / "down"
+var float  sigHigh    = na
+var float  sigLow     = na
+var float  sigRange   = na
+var int    sigHighBar = na
+var int    sigLowBar  = na
+var int    sigArmBar  = na
+var int    lastArmedWaveId = -1
+
+confirmed = barstate.isconfirmed
+
+rangeOk = waveDir != "" and not na(waveRange) and waveRange > 0 and (minRangeAtr <= 0 or na(atr) or waveRange >= atr * minRangeAtr)
+rNow    = waveDir == "up" ? (waveHigh - close) / waveRange : waveDir == "down" ? (close - waveLow) / waveRange : na
+
+// 保留注文・建玉がある間は新しいセットアップを拾わない
+var bool   oActive   = false
+freeSlot = strategy.position_size == 0 and not oActive
+
+if confirmed and not armed and rangeOk and freeSlot and waveId != lastArmedWaveId
+    retraceHit = not requireRetrace or (not na(rNow) and rNow >= retraceLo and rNow <= retraceHi)
+    if retraceHit
+        armed      := true
+        sigDir     := waveDir
+        sigHigh    := waveHigh
+        sigLow     := waveLow
+        sigRange   := waveRange
+        sigHighBar := waveHighBar
+        sigLowBar  := waveLowBar
+        sigArmBar  := bar_index
+        lastArmedWaveId := waveId
+
+// ============================================================================
+// === 注文状態 ===
+// ============================================================================
+var string oSide   = ""        // "long" / "short"
+var float  oEntry  = na
+var float  oSL     = na
+var float  oTP     = na
+var float  oStale  = na
+var int    oStartBar = na
+var int    oExpBar   = na
+var box    oBox      = na
+
+var float  posSL  = na
+var float  posTP  = na
+var int    posBar = na
+
+// ============================================================================
+// === ブレイク判定 / 待機キャンセル ===
+// ============================================================================
+bool   brokeUp = false
+bool   brokeDn = false
+string cancelReason = ""
+
+if armed and confirmed
+    rCur = sigDir == "up" ? (sigHigh - close) / sigRange : (close - sigLow) / sigRange
+    brokeUp := sigDir == "up"   and close > sigHigh
+    brokeDn := sigDir == "down" and close < sigLow
+
+    if not brokeUp and not brokeDn
+        if cancelLevel > 0 and rCur >= cancelLevel
+            cancelReason := "full_retrace"
+        else if (bar_index - sigArmBar) >= maxWaitBars
+            cancelReason := "timeout"
+        else if sigDir == "up" and not na(phRaw) and pvtBar > sigHighBar and phRaw < sigHigh
+            cancelReason := "lower_high"
+        else if sigDir == "down" and not na(plRaw) and pvtBar > sigLowBar and plRaw > sigLow
+            cancelReason := "higher_low"
+
+    if cancelReason != ""
+        armed  := false
+        sigDir := ""
+
+// --- ブレイク成立 → 継続方向の逆指値を置く ---
+if (brokeUp or brokeDn) and levelsOk
+    isLong = brokeUp                       // ブレイク方向 = 発注方向（継続トレード）
+    dirTxt = isLong ? "long" : "short"
+
+    en = isLong ? sigLow + sigRange * entryExt : sigHigh - sigRange * entryExt
+    sl = isLong ? sigLow + sigRange * slExtIn  : sigHigh - sigRange * slExtIn
+    tp = isLong ? sigLow + sigRange * tpExtIn  : sigHigh - sigRange * tpExtIn
+    st = isLong ? sigLow + sigRange * staleLevel : sigHigh - sigRange * staleLevel
+
+    // 最小SL距離ガード
+    minDist  = minStopDist
+    stopDist = math.abs(en - sl)
+    if minStopMode == "widen" and stopDist < minDist
+        sl := isLong ? en - minDist : en + minDist
+        stopDist := minDist
+    sizeOk = minStopMode != "skip" or stopDist >= minDist
+
+    rr = stopDist > 0 ? math.abs(tp - en) / stopDist : na
+
+    // ⚠ 継続トレードなので上位足トレンドは「発注方向」と揃える
+    trendOk = htfMode == "off" ? true : isLong ? (htfMode == "align" ? htfTrend >= 0 : htfTrend > 0) : (htfMode == "align" ? htfTrend <= 0 : htfTrend < 0)
+    atrOk   = maxAtrPct <= 0 or na(atr) or (atr / close * 100.0) <= maxAtrPct
+    rrOk    = minRR <= 0 or (not na(rr) and rr >= minRR)
+    // ブレイク足の終値が既にエントリー水準を超えている＝出遅れ
+    passedBy = isLong ? close >= en : close <= en
+    lateOk   = not (skipIfPassed and passedBy)
+
+    passed = trendOk and atrOk and sessOk and rrOk and sizeOk and lateOk and inDate and freeSlot
+
+    if passed
+        oActive   := true
+        oSide     := dirTxt
+        oEntry    := en
+        oSL       := sl
+        oTP       := tp
+        oStale    := st
+        oStartBar := bar_index
+        oExpBar   := bar_index + orderValidBars
+        posSL     := sl
+        posTP     := tp
+
+        strategy.entry("CNT", isLong ? strategy.long : strategy.short, qty=f_qty(en, sl), stop=en, comment=dirTxt)
+
+        // 描画：SL〜エントリーの帯（＝逆張りが失敗する領域）と TP ライン
+        bx = box.new(left=bar_index, top=math.max(en, sl), right=bar_index + drawBars, bottom=math.min(en, sl), bgcolor=isLong ? color.new(color.green, 85) : color.new(color.red, 85), border_color=isLong ? color.new(color.green, 50) : color.new(color.red, 50))
+        array.push(boxes, bx)
+        oBox := bx
+        array.push(levelLines, line.new(bar_index, tp, bar_index + drawBars, tp, xloc=xloc.bar_index, color=color.new(color.teal, 0), width=1, style=line.style_dashed))
+        array.push(signals, label.new(bar_index, tp, (isLong ? "LONG" : "SHORT") + " @" + f_p(en) + "\nRR " + f_r(rr), style=isLong ? label.style_label_down : label.style_label_up, color=isLong ? color.new(color.green, 20) : color.new(color.red, 20), textcolor=color.white, size=size.small))
+
+    armed  := false
+    sigDir := ""
+
+// ============================================================================
+// === 逆指値のライフサイクル（約定 / 失効） ===
+// ============================================================================
+if oActive and confirmed
+    filled  = strategy.position_size != 0
+    isLongO = oSide == "long"
+    stale   = useCancelStale and (isLongO ? low <= oStale : high >= oStale)
+    expired = bar_index >= oExpBar
+
+    if filled
+        oActive := false
+        posBar  := na(posBar) ? bar_index : posBar
+    else if (stale or expired) and bar_index > oStartBar
+        strategy.cancel("CNT")
+        if not na(oBox)
+            box.set_bgcolor(oBox, color.new(color.gray, 90))
+            box.set_border_color(oBox, color.new(color.gray, 60))
+        oActive := false
+
+// ============================================================================
+// === 建玉管理 ===
+// ============================================================================
+if strategy.position_size != 0
+    if na(posBar)
+        posBar := bar_index
+    // 水準の健全性チェック。TP/SLが建値の反対側にあると指値が即約定して損益を汚す。
+    avgPx  = strategy.position_avg_price
+    isLongP= strategy.position_size > 0
+    tpOk   = not na(posTP) and (isLongP ? posTP > avgPx : posTP < avgPx)
+    slOk   = not na(posSL) and (isLongP ? posSL < avgPx : posSL > avgPx)
+    if tpOk or slOk
+        strategy.exit("CNT-X", from_entry="CNT", stop=slOk ? posSL : na, limit=tpOk ? posTP : na, comment_profit="tp", comment_loss="sl")
+    else
+        strategy.close("CNT", comment="bad_levels")
+    if maxHold > 0 and (bar_index - posBar) >= maxHold
+        strategy.close("CNT", comment="max_hold")
+else
+    posBar := na
+
+// ============================================================================
+// === ステータスパネル ===
+// ============================================================================
+var table pnl = table.new(position.top_right, 2, 8, border_width=1, frame_width=1, frame_color=color.new(color.gray, 50))
+if showPanel and barstate.islast
+    f_row(pnl, 0, "wave",      waveDir == "" ? "-" : waveDir + " " + f_p(waveLow) + "/" + f_p(waveHigh))
+    f_row(pnl, 1, "retrace",   f_r(rNow))
+    f_row(pnl, 2, "armed",     armed ? sigDir + " (" + str.tostring(bar_index - sigArmBar) + "本)" : "no")
+    f_row(pnl, 3, "order",     oActive ? oSide + " @" + f_p(oEntry) : "-")
+    f_row(pnl, 4, "sl / tp",   oActive ? f_p(oSL) + " / " + f_p(oTP) : (strategy.position_size != 0 ? f_p(posSL) + " / " + f_p(posTP) : "-"))
+    f_row(pnl, 5, "position",  strategy.position_size == 0 ? "flat" : (strategy.position_size > 0 ? "long " : "short ") + str.tostring(math.abs(strategy.position_size)))
+    f_row(pnl, 6, "htf trend", htfTrend > 0 ? "up" : htfTrend < 0 ? "down" : "flat")
+    f_row(pnl, 7, "levels",    levelsOk ? "ok" : "INVALID")
+
+var label warnLb = na
+if barstate.islast and not levelsOk
+    label.delete(warnLb)
+    warnLb := label.new(bar_index, close, "水準が不正です\ntpExt > entryExt > slExt を満たしてください", style=label.style_label_left, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
+
+f_cleanup()
+
+// ============================================================================
+// === 検証メモ ===
+// ============================================================================
+// 【最優先】Bar Magnifier を有効にすること
+//   15m/6ヶ月の実測では、ドテンの 26件中15件が「1バー以内」で決着し、
+//   利益の58%（align時は86%）がそこから出ていた。上位4件は全て1バー決済。
+//   TradingView は足内の値動き順序を知らないため、逆指値の約定と利確の
+//   約定が同一足で起きたケースは仮定に依存する。Bar Magnifier（Premium）
+//   を有効にして、この比率と損益が維持されるかを最初に確認すること。
+//   維持されなければ、この戦略の6割は存在しない。
+//
+// 【パラメータ感度】1つずつ動かして、件数と損益の両方を記録する
+//   entryExt  1.62 / 1.90 / 2.00     … 浅いほど件数増・質低下
+//   slExtIn   1.38 / 1.62            … 1.62 は RR 改善だが刈られやすい
+//   tpExtIn   2.00 / 2.618 / 3.618   … 勝率とRRのトレードオフ
+//   depth     5 / 8 / 13
+//   requireRetrace ON/OFF            … 押し目を必須にする価値があるか
+//   htfMode   off / align            … 継続方向で判定するので逆張り版とは意味が違う
+//
+// 【比較対象】逆張り版（[kt] ZigZag Break Target v2 Strategy.pine）を
+//   useRev=true で回した結果と、本ファイルの結果を必ず並べて見ること。
+//   同一シグナルから逆張り部分だけを抜いたものなので、差分がそのまま
+//   「逆張りエントリーの寄与」になる。
+//
+// 【サンプル】15m×6ヶ月でバー数上限。これ以上期間は伸ばせないので、
+//   サンプルを増やすには他銘柄（他通貨ペア・指数）での検証か、
+//   30m/1h での別期間検証しかない。26件では勝率の信頼区間が広すぎる。
+//
+// 【コスト】Properties の手数料・スリッページを必ず実測値に。
+//   15m では 1R≒8.3USD、スプレッド0.3は0.036R なのでM1ほど致命的ではないが、
+//   0にしたままでは正しく評価できない。

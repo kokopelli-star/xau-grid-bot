@@ -1,0 +1,616 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © katchinakt
+//
+// ============================================================================
+// [kt] ZigZag Break Target v2 — Split Entry Strategy（分割指値でゾーンを拾う）
+// ----------------------------------------------------------------------------
+// 逆張りゾーンへのエントリーを1点の指値ではなく N分割の指値で置き、
+// 文字通り「ゾーンで拾う」執行を検証するための版。bot(Python/MT5)側で
+// 5本のpending orderを置く運用を、そのままバックテストで再現する。
+//
+// ロジック:
+//   1) ZigZag → 押し目 → ブレイクでターゲットゾーン(138〜162%)を生成
+//   2) ゾーン内に N本の指値を均等配置（売りゾーンなら 138/144/150/156/162）
+//   3) 価格がゾーンを利益方向に抜けたら、未約定の指値を取り消す
+//   4) ゾーン端まで戻ってきたら、最良建値の1本だけ残して他を決済
+//   5) 残した1本は建値ストップに移行
+//   6) 建値ストップに触れる、またはゾーンを突き抜けて190%に達したら
+//      その水準でブレイク方向へドテン（SL 138% / TP 261.8%）
+//
+// ※ ドテンの仕様は「[kt] ZigZag Break Target v2 Strategy.pine」と同じ。
+// ※ 分割指値はバックテストが楽観的に出やすい。下部の検証メモを必ず読むこと。
+// ============================================================================
+
+//@version=5
+// pyramiding は const 必須のため 10 で固定。実際の分割数は splitN で 1〜10 から選ぶ。
+strategy("[kt] ZigZag Break Target v2 Split Entry", overlay=true, pyramiding=10, initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.0, slippage=0, max_boxes_count=500, max_lines_count=500, max_labels_count=500, calc_on_order_fills=false, process_orders_on_close=true)
+
+// ============================================================================
+// === 入力パラメータ ===
+// ============================================================================
+grpTest = "0. 検証期間 (IS/OOS 分割用)"
+useRange = input.bool(false, "期間を限定する", group=grpTest)
+startTs  = input.time(timestamp("01 Jan 2020 00:00 +0000"), "  開始", group=grpTest)
+endTs    = input.time(timestamp("01 Jan 2030 00:00 +0000"), "  終了", group=grpTest)
+
+grpSplit = "1. 分割指値"
+splitN     = input.int(1, "分割数", minval=1, maxval=10, group=grpSplit, tooltip="ゾーンの手前エッジから奥エッジまでを均等配置します。1 のときはゾーン中央に1本。\n※15m/6ヶ月の実測では split0(手前エッジ) だけが黒字(+841.8 / PF2.11)で、split1以降は合計 -636.1。深い指値は『価格がゾーンを押し切っている』局面だけを拾う逆選択になります。既定は1本。")
+splitWindow= input.string("first_bar", "分割指値の有効期間", options=["first_bar", "zone_life"], group=grpSplit, tooltip="first_bar = 最初の約定が入った足で残りの指値を取り消す。ドテン注文を事前配置できるため、190%ちょうどで約定します（推奨）。\nzone_life = ゾーンが生きている間ずっと指値を残す。ドテン注文は奥エッジ通過後にしか置けず、速い動きでは約定価格が大きく劣化します。")
+tickOffset = input.int(0, "指値を内側へずらす (ticks)", minval=0, group=grpSplit, tooltip="TradingViewは『足の高値/安値が指値価格に達した』だけで約定させますが、実際の指値は価格が抜けないと約定しないことが多い。1〜3ticks 内側に置いて、楽観バイアスを削って検証してください。")
+cancelUnfilledOnProfit = input.bool(true, "利益方向に抜けたら未約定の指値を取り消す", group=grpSplit)
+skipIfPassed = input.bool(true, "ブレイク足が既にゾーンを通過していたら見送る", group=grpSplit, tooltip="ブレイク足の終値がゾーンの奥エッジを超えている場合、全ての指値が成行同然で約定してしまうため見送ります。")
+
+grpRisk = "2. サイジング"
+qtyMode = input.string("fixed", "ロット計算", options=["fixed", "risk"], group=grpRisk, tooltip="ここで指定するのは分割前の合計数量。各指値には 合計/分割数 が割り当てられます。")
+fixedQty= input.float(5.0, "  固定数量 (合計)", minval=0.0, step=0.1, group=grpRisk)
+riskPct = input.float(1.0, "  リスク % / trade", minval=0.01, step=0.1, group=grpRisk)
+maxLev  = input.float(10.0, "  レバレッジ上限 (0=無効)", minval=0, step=1, group=grpRisk)
+minStopMode = input.string("skip", "最小SL距離のガード", options=["skip", "off"], group=grpRisk)
+minStopAtr  = input.float(1.0, "  最小SL距離 (× ATR)", minval=0, step=0.1, group=grpRisk)
+minStopAbs  = input.float(0.0, "  最小SL距離 (価格, 0=無効)", minval=0, step=0.01, group=grpRisk)
+maxHold = input.int(0, "最大保有バー数 (0=無効)", minval=0, group=grpRisk)
+
+grpZZ = "3. ZigZag / 波"
+depth       = input.int(8,     "ZigZag Depth (left/right)", minval=1, group=grpZZ)
+minRangeAtr = input.float(0.0, "波の最小サイズ (× ATR, 0=無効)", minval=0, step=0.1, group=grpZZ)
+showZZ      = input.bool(true, "ZigZag ラインを描画", group=grpZZ)
+
+grpSig = "4. リトレース / ゾーン"
+retraceLo  = input.float(0.38, "Retrace Low (38%)",  step=0.01, group=grpSig)
+retraceHi  = input.float(0.62, "Retrace High (62%)", step=0.01, group=grpSig)
+targetLo   = input.float(1.38, "Zone 手前 (138%)",  step=0.01, group=grpSig)
+targetHi   = input.float(1.62, "Zone 奥 (162%)",    step=0.01, group=grpSig)
+maxWaitBars= input.int(60, "ブレイク待ちの上限 (bars)", minval=1, group=grpSig)
+cancelLevel= input.float(1.00, "待機キャンセルの戻し率 (0=無効)", minval=0, step=0.01, group=grpSig)
+
+grpExec = "5. 執行ルール"
+slExt         = input.float(1.90, "SL / ドテン水準 (190%)", step=0.01, group=grpExec, tooltip="ゾーンを突き抜けたと判断する水準。useRev=true ではここがドテンの発火点になります。")
+tpMode        = input.string("opp_zone_touch", "利確方法", options=["opp_zone_touch", "opp_zone_signal", "fixed"], group=grpExec)
+tpExt         = input.float(1.00, "  TP 拡張率 (fixed時 / RR算出用)", step=0.01, group=grpExec)
+zoneValidBars = input.int(30,   "ゾーン有効期限 (bars)", minval=1, group=grpExec)
+useCancelStale= input.bool(true, "深い戻しでゾーンを破棄", group=grpExec)
+staleLevel    = input.float(0.618, "  破棄水準 (波の戻し率)", minval=0.0, maxval=0.99, step=0.01, group=grpExec)
+
+grpGB = "6. 建値ストップへの移行"
+useGiveBack  = input.bool(true, "ゾーン端に戻ったら最良建値だけ残す", group=grpGB, tooltip="含み益が出た後、ゾーン端まで戻ってきたら最良建値の1本を残して他を決済し、残った1本は建値ストップに移行します。")
+profitExt    = input.float(1.00, "  「利益が出た」と判定する水準", step=0.01, group=grpGB, tooltip="起点からの拡張率。1.00 なら『ブレイク水準まで戻した＝十分な含み益』。\nここを 1.38（ゾーン手前エッジ）にすると、わずかな含み益で建値ストップに移行してしまい、通常の揺り戻しで刈られます。")
+giveBackEdge = input.string("near", "  戻し判定に使うゾーン端", options=["near", "mid", "far"], group=grpGB, tooltip="near = 先に触れた側のエッジ（売りなら138%）。ここまで戻ってきたら整理します。")
+beMaxBars    = input.int(40, "  建値ストップ移行後の保有上限 (bars, 0=無効)", minval=0, group=grpGB, tooltip="建値ストップは決着がつかないまま何日も建玉を抱え、その間ずっと新規ゾーンをブロックします。上限を必ず設けてください。")
+
+grpRev = "7. ドテン"
+useRev     = input.bool(true, "ゾーンを突き抜けたらドテンする", group=grpRev, tooltip="ゾーンの奥エッジを抜けた後、190%（slExt）水準でブレイク方向へドテンします。")
+revOnBreakeven = input.bool(false, "  建値ストップでもドテンする", group=grpRev, tooltip="ONにすると建値ストップに触れた時点でもドテンします。\n※15m実測では、190%固定（＝明確な突き抜け）の方がドテンの質が明確に上でした（単位あたり +295.6 vs -34.4）。既定はOFFです。")
+revSlLevel = input.string("zone_near", "  ドテン後のSL", options=["zone_near", "zone_far", "break"], group=grpRev)
+revTpExt   = input.float(2.618, "  ドテン後のTP 拡張率", step=0.01, group=grpRev)
+revQtyMul  = input.float(1.0, "  ドテンのロット倍率", minval=0.1, step=0.1, group=grpRev)
+
+grpFilter = "8. フィルタ"
+htfMode    = input.string("off", "上位足トレンドフィルタ", options=["off", "align", "align_strict"], group=grpFilter, tooltip="逆張り（フェード）方向で判定します。")
+htfTf      = input.timeframe("240", "  上位足", group=grpFilter)
+htfLen     = input.int(50,   "  上位足 EMA 期間", minval=1, group=grpFilter)
+atrLen     = input.int(14,   "ATR 期間", minval=1, group=grpFilter)
+maxAtrPct  = input.float(0.0, "ATR/価格 の上限 (%, 0=無効)", minval=0, step=0.05, group=grpFilter)
+useSess    = input.bool(false, "取引セッションを限定", group=grpFilter)
+sessSpec   = input.session("0000-2400", "  許可セッション", group=grpFilter)
+exSessOn   = input.bool(false, "除外セッションを使う", group=grpFilter)
+exSessSpec = input.session("2130-2300", "  除外セッション", group=grpFilter)
+tzIn       = input.string("", "  タイムゾーン (空欄=取引所)", group=grpFilter)
+
+grpDraw = "9. 描画"
+drawBars  = input.int(30,  "描画の長さ (bars)", minval=1, group=grpDraw)
+maxKeep   = input.int(100, "Max kept objects", minval=10, group=grpDraw)
+showPanel = input.bool(true, "ステータスパネルを表示", group=grpDraw)
+
+// ============================================================================
+// === 共通ヘルパー ===
+// ============================================================================
+f_p(float x) => na(x) ? "null" : str.tostring(x, format.mintick)
+f_r(float x) => na(x) ? "null" : str.tostring(x, "#.###")
+
+f_row(table t, int row, string k, string v) =>
+    table.cell(t, 0, row, k, text_color=color.gray,  text_size=size.small, bgcolor=color.new(color.black, 80), text_halign=text.align_left)
+    table.cell(t, 1, row, v, text_color=color.white, text_size=size.small, bgcolor=color.new(color.black, 80), text_halign=text.align_right)
+
+atr    = ta.atr(atrLen)
+inDate = not useRange or (time >= startTs and time <= endTs)
+minStopDist = minStopMode == "off" ? 0.0 : math.max(na(atr) ? 0.0 : atr * minStopAtr, minStopAbs)
+
+f_qty(float px, float stopPx) =>
+    d     = math.max(math.abs(px - stopPx), syminfo.mintick)
+    qRisk = strategy.equity * riskPct / 100.0 / d
+    qCap  = maxLev <= 0 ? qRisk : strategy.equity * maxLev / math.max(px, syminfo.mintick)
+    qtyMode == "fixed" ? fixedQty : math.min(qRisk, qCap)
+
+htfOk = timeframe.in_seconds(htfTf) >= timeframe.in_seconds(timeframe.period)
+[htfClose, htfEma] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, htfLen)[1]], lookahead=barmerge.lookahead_off)
+htfTrend = not htfOk or na(htfEma) ? 0 : htfClose > htfEma ? 1 : htfClose < htfEma ? -1 : 0
+
+tzUse    = tzIn == "" ? syminfo.timezone : tzIn
+inSess   = not useSess or not na(time(timeframe.period, sessSpec, tzUse))
+inExSess = exSessOn and not na(time(timeframe.period, exSessSpec, tzUse))
+sessOk   = inSess and not inExSess
+
+// ============================================================================
+// === 保持用配列 / クリーンアップ ===
+// ============================================================================
+var line[]  levelLines = array.new_line()
+var line[]  zzLines    = array.new_line()
+var box[]   boxes      = array.new_box()
+var label[] signals    = array.new_label()
+
+f_cleanup() =>
+    while array.size(levelLines) > maxKeep
+        line.delete(array.shift(levelLines))
+    while array.size(zzLines) > maxKeep
+        line.delete(array.shift(zzLines))
+    while array.size(boxes) > maxKeep
+        box.delete(array.shift(boxes))
+    while array.size(signals) > maxKeep
+        label.delete(array.shift(signals))
+
+// ============================================================================
+// === ZigZag コア ===
+// ============================================================================
+phRaw  = ta.pivothigh(high, depth, depth)
+plRaw  = ta.pivotlow(low,  depth, depth)
+pvtBar = bar_index - depth
+
+var string curType   = ""
+var float  curPrice  = na
+var int    curBar    = na
+var string prevType  = ""
+var float  prevPrice = na
+var int    prevBar   = na
+var int    waveId    = 0
+
+bool didShift  = false
+bool didUpdate = false
+
+bothPvt  = not na(phRaw) and not na(plRaw)
+lowFirst = bothPvt and curType == "high"
+
+string s1Type = ""
+float  s1Price = na
+string s2Type = ""
+float  s2Price = na
+
+if bothPvt
+    s1Type  := lowFirst ? "low"  : "high"
+    s1Price := lowFirst ? plRaw  : phRaw
+    s2Type  := lowFirst ? "high" : "low"
+    s2Price := lowFirst ? phRaw  : plRaw
+else if not na(phRaw)
+    s1Type  := "high"
+    s1Price := phRaw
+else if not na(plRaw)
+    s1Type  := "low"
+    s1Price := plRaw
+
+if s1Type != ""
+    if s1Type == curType
+        if (s1Type == "high" and s1Price > curPrice) or (s1Type == "low" and s1Price < curPrice)
+            curPrice  := s1Price
+            curBar    := pvtBar
+            waveId    += 1
+            didUpdate := true
+    else
+        prevType  := curType
+        prevPrice := curPrice
+        prevBar   := curBar
+        curType   := s1Type
+        curPrice  := s1Price
+        curBar    := pvtBar
+        waveId    += 1
+        didShift  := true
+
+if s2Type != ""
+    if s2Type == curType
+        if (s2Type == "high" and s2Price > curPrice) or (s2Type == "low" and s2Price < curPrice)
+            curPrice  := s2Price
+            curBar    := pvtBar
+            waveId    += 1
+            didUpdate := true
+    else
+        prevType  := curType
+        prevPrice := curPrice
+        prevBar   := curBar
+        curType   := s2Type
+        curPrice  := s2Price
+        curBar    := pvtBar
+        waveId    += 1
+        didShift  := true
+
+var line zzLine = na
+if showZZ and didShift and not na(prevBar) and not na(prevPrice)
+    zzLine := line.new(prevBar, prevPrice, curBar, curPrice, xloc=xloc.bar_index, color=color.new(color.gray, 30), width=1)
+    array.push(zzLines, zzLine)
+else if showZZ and didUpdate and not na(zzLine)
+    line.set_xy2(zzLine, curBar, curPrice)
+
+waveDir     = prevType == "low" and curType == "high" ? "up" : prevType == "high" and curType == "low" ? "down" : ""
+waveHigh    = waveDir == "up" ? curPrice : waveDir == "down" ? prevPrice : na
+waveLow     = waveDir == "up" ? prevPrice : waveDir == "down" ? curPrice : na
+waveHighBar = waveDir == "up" ? curBar   : waveDir == "down" ? prevBar  : na
+waveLowBar  = waveDir == "up" ? prevBar  : waveDir == "down" ? curBar   : na
+waveRange   = waveHigh - waveLow
+
+// ============================================================================
+// === ゾーン / 建玉の状態 ===
+// ============================================================================
+var bool   zPending  = false   // 分割指値が有効（未約定を含む）
+var string zSide     = ""      // フェード方向 "sell" / "buy"
+var float  zLow      = na
+var float  zHigh     = na
+var float  zSL       = na      // 190% 水準（＝ドテン発火点）
+var float  zTP       = na
+var float  zStale    = na
+var float  zProfit   = na      // ここに到達したら「含み益が出た」とみなす
+var int    zStartBar = na
+var int    zExpBar   = na
+var float  zRevSL    = na
+var float  zRevTP    = na
+var box    zBox      = na
+
+var string phase   = "flat"    // flat / fade / rev
+var int    posDir  = 0         // フェード建玉の方向 1=long / -1=short
+var float  posTP   = na
+var int    posBar  = na
+var bool   inProfit= false     // ゾーンを利益方向に抜けた
+var bool   pastFar = false     // ゾーンの奥エッジを損失方向に抜けた（＝全指値が約定済み）
+var bool   beMode  = false     // 建値ストップへ移行済み
+var float  bePrice = na
+var int    beBar   = na
+var float  revSL   = na
+var float  revTP   = na
+var string revDir  = ""
+
+// ============================================================================
+// === リトレース判定 ===
+// ============================================================================
+var bool   armed      = false
+var string sigDir     = ""
+var float  sigHigh    = na
+var float  sigLow     = na
+var float  sigRange   = na
+var int    sigHighBar = na
+var int    sigLowBar  = na
+var int    sigArmBar  = na
+var int    lastArmedWaveId = -1
+
+confirmed = barstate.isconfirmed
+freeSlot  = strategy.position_size == 0 and not zPending
+
+rangeOk = waveDir != "" and not na(waveRange) and waveRange > 0 and (minRangeAtr <= 0 or na(atr) or waveRange >= atr * minRangeAtr)
+rNow    = waveDir == "up" ? (waveHigh - close) / waveRange : waveDir == "down" ? (close - waveLow) / waveRange : na
+
+// ※ ここに freeSlot を入れてはいけない。建玉中にアームが止まるとブレイクが検出されず、
+//    逆側ゾーンが生成されないため tpMode=opp_zone_* の利確が永久に発動しなくなる。
+//    建玉中に拾わない制御は、ゾーン生成側（passed の freeSlot）だけで行う。
+if confirmed and not armed and rangeOk and waveId != lastArmedWaveId
+    if not na(rNow) and rNow >= retraceLo and rNow <= retraceHi
+        armed      := true
+        sigDir     := waveDir
+        sigHigh    := waveHigh
+        sigLow     := waveLow
+        sigRange   := waveRange
+        sigHighBar := waveHighBar
+        sigLowBar  := waveLowBar
+        sigArmBar  := bar_index
+        lastArmedWaveId := waveId
+
+// ============================================================================
+// === ブレイク判定 / 待機キャンセル ===
+// ============================================================================
+bool   brokeUp = false
+bool   brokeDn = false
+string cancelReason = ""
+
+if armed and confirmed
+    rCur = sigDir == "up" ? (sigHigh - close) / sigRange : (close - sigLow) / sigRange
+    brokeUp := sigDir == "up"   and close > sigHigh
+    brokeDn := sigDir == "down" and close < sigLow
+
+    if not brokeUp and not brokeDn
+        if cancelLevel > 0 and rCur >= cancelLevel
+            cancelReason := "full_retrace"
+        else if (bar_index - sigArmBar) >= maxWaitBars
+            cancelReason := "timeout"
+        else if sigDir == "up" and not na(phRaw) and pvtBar > sigHighBar and phRaw < sigHigh
+            cancelReason := "lower_high"
+        else if sigDir == "down" and not na(plRaw) and pvtBar > sigLowBar and plRaw > sigLow
+            cancelReason := "higher_low"
+
+    if cancelReason != ""
+        armed  := false
+        sigDir := ""
+
+// --- ブレイク成立 → ゾーンに N本の指値を置く ---
+if brokeUp or brokeDn
+    tradeDirS = brokeUp ? "sell" : "buy"      // 逆張りなので波と逆方向
+
+    zoneA = brokeUp ? sigLow + sigRange * targetLo : sigHigh - sigRange * targetLo  // 手前側 (138%)
+    zoneB = brokeUp ? sigLow + sigRange * targetHi : sigHigh - sigRange * targetHi  // 奥側   (162%)
+    zl = math.min(zoneA, zoneB)
+    zh = math.max(zoneA, zoneB)
+    sl = brokeUp ? sigLow + sigRange * slExt : sigHigh - sigRange * slExt
+    tp = brokeUp ? sigLow + sigRange * tpExt : sigHigh - sigRange * tpExt
+    st = brokeUp ? sigLow + sigRange * staleLevel : sigHigh - sigRange * staleLevel
+    mid = (zoneA + zoneB) / 2
+
+    stopDist = math.abs(mid - sl)
+    sizeOk = minStopMode != "skip" or stopDist >= minStopDist
+    rr = stopDist > 0 ? math.abs(mid - tp) / stopDist : na
+
+    trendOk = htfMode == "off" ? true : tradeDirS == "sell" ? (htfMode == "align" ? htfTrend <= 0 : htfTrend < 0) : (htfMode == "align" ? htfTrend >= 0 : htfTrend > 0)
+    atrOk   = maxAtrPct <= 0 or na(atr) or (atr / close * 100.0) <= maxAtrPct
+    // ブレイク足が既にゾーンの奥エッジを超えている＝全指値が成行同然で約定してしまう
+    lateOk  = not (skipIfPassed and (brokeUp ? close >= zh : close <= zl))
+    passed  = trendOk and atrOk and sessOk and sizeOk and lateOk and inDate and freeSlot
+
+    if passed
+        zPending  := true
+        zSide     := tradeDirS
+        zLow      := zl
+        zHigh     := zh
+        zSL       := sl
+        zTP       := tp
+        zStale    := st
+        zProfit   := brokeUp ? sigLow + sigRange * profitExt : sigHigh - sigRange * profitExt
+        zStartBar := bar_index
+        zExpBar   := bar_index + zoneValidBars
+        posDir    := tradeDirS == "sell" ? -1 : 1
+        posTP     := tpMode == "fixed" ? tp : na
+        inProfit  := false
+        pastFar   := false
+        beMode    := false
+        bePrice   := na
+        beBar     := na
+        zRevSL    := revSlLevel == "zone_far" ? zoneB : revSlLevel == "break" ? (brokeUp ? sigHigh : sigLow) : zoneA
+        zRevTP    := brokeUp ? sigLow + sigRange * revTpExt : sigHigh - sigRange * revTpExt
+        revSL     := zRevSL
+        revTP     := zRevTP
+
+        // --- N本の指値を均等配置。手前エッジ(zoneA)から奥エッジ(zoneB)へ ---
+        isSellZ = tradeDirS == "sell"
+        qtyEach = f_qty(mid, sl) / splitN
+        off = tickOffset * syminfo.mintick
+        for i = 0 to splitN - 1
+            frac = splitN == 1 ? 0.5 : i / (splitN - 1.0)
+            px   = zoneA + (zoneB - zoneA) * frac
+            // 内側（＝より不利な側）へずらして楽観バイアスを削る
+            pxAdj = isSellZ ? px + off : px - off
+            strategy.entry("Z" + str.tostring(i), isSellZ ? strategy.short : strategy.long, qty=qtyEach, limit=pxAdj, comment="split" + str.tostring(i))
+
+        bx = box.new(left=bar_index, top=zh, right=bar_index + drawBars, bottom=zl, bgcolor=isSellZ ? color.new(color.red, 82) : color.new(color.aqua, 82), border_color=isSellZ ? color.new(color.red, 40) : color.new(color.aqua, 40))
+        array.push(boxes, bx)
+        zBox := bx
+        array.push(levelLines, line.new(bar_index, sl, bar_index + drawBars, sl, xloc=xloc.bar_index, color=color.new(color.orange, 0), width=1, style=line.style_dashed))
+        array.push(signals, label.new(bar_index, isSellZ ? zh : zl, str.upper(tradeDirS) + " x" + str.tostring(splitN) + "\nRR " + f_r(rr), style=isSellZ ? label.style_label_down : label.style_label_up, color=isSellZ ? color.new(color.red, 20) : color.new(color.blue, 20), textcolor=color.white, size=size.small))
+
+    armed  := false
+    sigDir := ""
+
+// --- 逆側ゾーンによる利確（フェード建玉のみ） ---
+if (brokeUp or brokeDn) and strategy.position_size != 0 and phase == "fade" and tpMode != "fixed"
+    isShortPos = strategy.position_size < 0
+    if (isShortPos and brokeDn) or (not isShortPos and brokeUp)
+        oppNear = brokeDn ? sigHigh - sigRange * targetLo : sigLow + sigRange * targetLo
+        if tpMode == "opp_zone_signal"
+            strategy.close_all(comment="opp_zone")
+        else if na(posTP)
+            if isShortPos ? oppNear < strategy.position_avg_price : oppNear > strategy.position_avg_price
+                posTP := oppNear
+
+// ============================================================================
+// === フェーズ判定 ===
+// ============================================================================
+curSign = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+if curSign == 0
+    phase := "flat"
+else if phase == "fade" and curSign != posDir
+    phase  := "rev"
+    posBar := na
+    revDir := ""
+    array.push(signals, label.new(bar_index, close, "REV " + (curSign > 0 ? "BUY" : "SELL"), style=curSign > 0 ? label.style_label_up : label.style_label_down, color=color.new(color.orange, 10), textcolor=color.white, size=size.tiny))
+else if phase == "flat"
+    phase := "fade"
+
+// 含み益の判定。ゾーン端ではなく profitExt 水準（既定=ブレイク水準）に到達したかで見る。
+// ライフサイクルより先に評価しないと、未約定指値の取消が1本遅れる。
+if phase == "fade" and confirmed and not inProfit and not na(zProfit)
+    if posDir < 0 ? low <= zProfit : high >= zProfit
+        inProfit := true
+
+// ============================================================================
+// === ゾーンのライフサイクル（未約定指値の管理） ===
+// ============================================================================
+// ゾーンの奥エッジを損失方向に抜けたか。ここを抜けた時点で全指値は約定済みのはず。
+if (zPending or phase == "fade") and confirmed and not pastFar and not na(zHigh)
+    if zSide == "sell" ? high > zHigh : low < zLow
+        pastFar := true
+
+if zPending and confirmed
+    isSellZ = zSide == "sell"
+    expired = bar_index >= zExpBar
+    stale   = useCancelStale and (isSellZ ? low <= zStale : high >= zStale)
+    noPos   = strategy.position_size == 0
+    // 未約定の指値を残したままにしない。特に pastFar 以降に残すと、
+    // ドテンが発火した足で「現在値より不利な側の指値」が成行同然で約定し、
+    // ドテン建玉を打ち消してしまう（04/13 に実際に発生）。
+    doCancel = (noPos and (expired or stale) and bar_index > zStartBar) or pastFar or (splitWindow == "first_bar" and phase == "fade") or (phase == "fade" and cancelUnfilledOnProfit and inProfit) or phase == "rev"
+    if doCancel
+        for i = 0 to splitN - 1
+            strategy.cancel("Z" + str.tostring(i))
+        if noPos and not na(zBox)
+            box.set_bgcolor(zBox, color.new(color.gray, 90))
+            box.set_border_color(zBox, color.new(color.gray, 60))
+        zPending := false
+
+// ============================================================================
+// === 建玉管理 ===
+// ============================================================================
+if phase == "fade"
+    if na(posBar)
+        posBar := bar_index
+    isSellP = posDir < 0
+    edgePx  = giveBackEdge == "far" ? (isSellP ? zHigh : zLow) : giveBackEdge == "mid" ? (zLow + zHigh) / 2 : (isSellP ? zLow : zHigh)
+
+    // 最良建値の建玉を特定する（売りは高いほど、買いは安いほど良い）
+    int   bestIdx = -1
+    float bestPx  = na
+    for i = 0 to strategy.opentrades - 1
+        p = strategy.opentrades.entry_price(i)
+        if na(bestPx) or (isSellP ? p > bestPx : p < bestPx)
+            bestPx  := p
+            bestIdx := i
+
+    // ③ 建玉ごとに決済注文を出す
+    //    ・含み益が出た後の「最良以外」→ ゾーン端に撤退ストップ
+    //    ・最良の1本 → 建値ストップへ移行後は bePrice、それ以前は useRev がSLを兼ねる
+    for i = 0 to strategy.opentrades - 1
+        eid    = strategy.opentrades.entry_id(i)
+        isBest = i == bestIdx
+        if useGiveBack and inProfit and not isBest
+            strategy.exit("X_" + eid, from_entry=eid, stop=edgePx, limit=posTP, comment="giveback")
+        else
+            // 建値ストップはドテン注文が兼ねない限り strategy.exit で置く
+            beStop = beMode and isBest and not (useRev and revOnBreakeven)
+            stopPx = beStop ? bePrice : (useRev ? na : zSL)
+            if not na(stopPx) or not na(posTP)
+                strategy.exit("X_" + eid, from_entry=eid, stop=stopPx, limit=posTP, comment_profit="tp", comment_loss=beStop ? "be" : "sl")
+
+    // ④ 建玉が1本になったら建値ストップへ移行
+    if useGiveBack and inProfit and not beMode and strategy.opentrades == 1
+        beMode  := true
+        bePrice := strategy.opentrades.entry_price(0)
+        beBar   := bar_index
+        array.push(signals, label.new(bar_index, bePrice, "BE " + f_p(bePrice), style=isSellP ? label.style_label_down : label.style_label_up, color=color.new(color.purple, 20), textcolor=color.white, size=size.tiny))
+
+    // 建値ストップは決着がつかないまま建玉を抱え続け、その間ずっと新規ゾーンを塞ぐ
+    if beMode and beMaxBars > 0 and not na(beBar) and (bar_index - beBar) >= beMaxBars
+        strategy.close_all(comment="be_timeout")
+    if maxHold > 0 and (bar_index - posBar) >= maxHold
+        strategy.close_all(comment="max_hold")
+
+else if phase == "rev"
+    if na(posBar)
+        posBar := bar_index
+    avgPx     = strategy.position_avg_price
+    isLongRev = strategy.position_size > 0
+    revTpOk   = not na(revTP) and (isLongRev ? revTP > avgPx : revTP < avgPx)
+    revSlOk   = not na(revSL) and (isLongRev ? revSL < avgPx : revSL > avgPx)
+    if revTpOk or revSlOk
+        strategy.exit("REV-X", from_entry="REV", stop=revSlOk ? revSL : na, limit=revTpOk ? revTP : na, comment_profit="rev_tp", comment_loss="rev_sl")
+    else
+        strategy.close("REV", comment="rev_bad_levels")
+    if maxHold > 0 and (bar_index - posBar) >= maxHold
+        strategy.close("REV", comment="max_hold")
+else
+    posBar := na
+
+// ============================================================================
+// === ドテン注文 ===
+// ============================================================================
+// 発火点は「ゾーン突き抜け(190%)」だが、建値ストップへ移行した後は建値そのもの。
+// つまり建値ストップに触れることとドテンの発火は同じイベントになる。
+// 分割指値(138〜162%)は必ず 190% より先に約定するため、ブレイク足で先置きしても
+// 順序が逆転することはない。
+// 発火点は原則 190%（zSL）固定。revOnBreakeven=true のときだけ建値へ移す。
+revTrigger = (revOnBreakeven and beMode) ? bePrice : zSL
+// ドテン注文は原則として事前配置する。手前エッジの指値は必ず 190% より先に約定するため、
+// 未約定の指値が残っていなければ順序が逆転することはない。
+//   first_bar … 最初の約定が入った足で残りの指値を取り消すので、常に事前配置できる。
+//                190% ちょうどで約定するため、設計どおりのペイオフ(1.38)が出る。
+//   zone_life … 指値が残り続けるので、奥エッジ通過後にしか発注できない。
+//                速い動きでは発注時点で価格が 190% を大きく超えており、
+//                実測ペイオフが 0.30 まで劣化した（利確値幅 11.6 / 損切値幅 39.2 USD）。
+revReady = splitWindow == "first_bar" or pastFar or (revOnBreakeven and beMode)
+revPend  = useRev and not na(revTrigger) and not na(revSL) and phase != "rev" and revReady and (phase == "fade" or zPending)
+revWant  = posDir < 0 ? "long" : "short"
+if revPend
+    if revDir != "" and revDir != revWant
+        strategy.cancel("REV")
+    // ドテン注文の数量は既存建玉と相殺されるため、相殺後に目標サイズが残るよう積み増す。
+    // 発注時と約定時で建玉数が変わるとズレるが、splitN=1 なら誤差は最大1単位に収まる。
+    revTarget = f_qty(revTrigger, revSL) * revQtyMul
+    strategy.entry("REV", revWant == "long" ? strategy.long : strategy.short, qty=revTarget + math.abs(strategy.position_size), stop=revTrigger, comment="rev")
+    revDir := revWant
+else if phase != "rev"
+    if revDir != ""
+        strategy.cancel("REV")
+        revDir := ""
+
+// ============================================================================
+// === ステータスパネル ===
+// ============================================================================
+var table pnl = table.new(position.top_right, 2, 9, border_width=1, frame_width=1, frame_color=color.new(color.gray, 50))
+if showPanel and barstate.islast
+    f_row(pnl, 0, "wave",      waveDir == "" ? "-" : waveDir)
+    f_row(pnl, 1, "retrace",   f_r(rNow))
+    f_row(pnl, 2, "armed",     armed ? sigDir : "no")
+    f_row(pnl, 3, "zone",      zPending or phase == "fade" ? zSide + " " + f_p(zLow) + "-" + f_p(zHigh) : "-")
+    f_row(pnl, 4, "phase",     phase)
+    f_row(pnl, 5, "open",      str.tostring(strategy.opentrades) + " 本 / size " + str.tostring(math.abs(strategy.position_size)))
+    f_row(pnl, 6, "in profit", inProfit ? (beMode ? "BE " + f_p(bePrice) : "yes") : (pastFar ? "no (past far)" : "no"))
+    f_row(pnl, 7, "rev trig",  revPend ? f_p(revTrigger) : "-")
+    f_row(pnl, 8, "htf trend", htfTrend > 0 ? "up" : htfTrend < 0 ? "down" : "flat")
+
+f_cleanup()
+
+// ============================================================================
+// === 検証メモ ===
+// ============================================================================
+// 【最優先】Bar Magnifier を有効にすること
+//   分割指値は狭いゾーンに5本並ぶため、15m足1本でゾーン全体をスイープする
+//   ケースが頻発する。TradingView はその足で5本すべてを指値価格ちょうどで
+//   約定させるが、実際の値動き順序は分からない。「3本約定して反転」なのか
+//   「5本約定して突き抜け」なのかがバックテストでは決まらない。
+//
+// 【指値の楽観バイアス】tickOffset を必ず動かして感度を見ること
+//   TradingView は「足の高値/安値が指値価格に達した」だけで約定させるが、
+//   実際の指値は価格が抜けないと約定しないことが多い。特に
+//   「ゾーン手前エッジにちょうどタッチして反転」という最も美味しいケースで
+//   バックテストは約定させ、実際は約定しない、という乖離が起きる。
+//   tickOffset = 0 / 2 / 5 で結果がどれだけ変わるかを確認すること。
+//   大きく変わるなら、その利益は約定仮定に依存している。
+//
+// 【CSVの読み方】
+//   split0〜split4 … 分割指値の約定（どの水準が刺さったかが分かる）
+//   giveback      … ゾーン端に戻ったため最良以外を整理
+//   tp / sl / be  … 利確 / 損切り / 建値ストップ
+//   be_timeout    … 建値ストップのまま決着せず保有上限に到達
+//
+// 【健全性チェック】再実行時は必ず以下を確認すること
+//   ・tp での決済が 0件になっていないか（0件なら利確経路が死んでいる）
+//   ・エントリー rev / 決済 split* という組み合わせが出ていないか（注文の打ち消し）
+//   ・REV の数量が revQtyMul どおりに揃っているか（バラつくなら相殺されている）
+//   ・ゾーン数（split0 の件数）が1点版のBASE件数と同程度あるか
+//   rev           … ドテン発動（＝逆張り建玉はここで決済）
+//   rev_tp/rev_sl … ドテン建玉の決済
+//   分割ごとに1トレードとして記録されるので、件数は分割数ぶん増える。
+//   「どの分割水準の期待値が高いか」を集計すれば、分割配置の最適化ができる。
+//
+// 【実測で分かったこと】15m / 2026-02〜07 / XAUUSD / htf=off
+//
+// 1) 分割は有害。深い指値は逆選択になる。
+//      split0(138%)  42件 勝率40.5% PF2.11  +841.8   ← 利確到達 17件
+//      split1        18件 勝率16.7%         -323.7   ← 利確到達  2件
+//      split2〜4     22件                   -312.4   ← 利確到達  0件
+//    split2以降は一度も利確に到達していない。深い指値が刺さるのは
+//    「価格がゾーンを押し切って進んでいる」失敗局面だけのため。
+//    → splitN=1（手前エッジ1本）が最良。既定値をそうしてある。
+//
+// 2) ドテンの約定価格が成績を決める。
+//    事前配置（190%ちょうどで約定）… 単位あたり +295.6（1点版で実測）
+//    奥エッジ通過後に発注        … 実測ペイオフ 0.30、単位あたり -129.3
+//    利確値幅 11.6 / 損切値幅 39.2 USD と、設計値(1.38)から完全に逆転していた。
+//    → splitWindow=first_bar で事前配置に戻すこと。
+//
+// 3) useGiveBack の ON/OFF で構成が反転する。
+//      ON  … 逆張り -250.9 / ドテン +3,080（建値ストップがドテン到達率を84%→16%に落とす）
+//      OFF … 逆張り +205.6 / ドテン -1,839（ただしドテンは上記2の劣化状態）
+//    2を直した状態で改めて ON/OFF を比較すること。
+//
+// 【比較対象】1点エントリー版（[kt] ZigZag Break Target v2 Strategy.pine）と
+//   同じ期間・同じパラメータで並べること。15m/off の実測は
+//     1点版 BASE 35件 単位あたり +112.1 ／ REV 26件 単位あたり +295.6（合計 +407.7）
