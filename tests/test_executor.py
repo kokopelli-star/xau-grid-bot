@@ -3,6 +3,7 @@ from unittest.mock import patch, MagicMock
 import numpy as np
 from state import GridState
 from executor import GridManager
+from terminal_binding import BindingError
 
 class TestGridManager(unittest.TestCase):
     def setUp(self):
@@ -13,7 +14,10 @@ class TestGridManager(unittest.TestCase):
         self.state.is_new_request = False
         
         # GridManagerを初期化
-        self.manager = GridManager(self.state, symbol="XAUUSD", volume=0.02, half_close_dist=10.0)
+        # Strategy-only tests inject a mock guard; real guard coverage is separate.
+        binding = MagicMock()
+        binding.send.side_effect = lambda api, request: api.order_send(request)
+        self.manager = GridManager(self.state, binding=binding, symbol="XAUUSD", volume=0.02, half_close_dist=10.0)
 
     def _get_mock_rates(self, count, high_val, low_val, close_val):
         """ATR計算用のモックデータを生成するヘルパー関数"""
@@ -115,9 +119,17 @@ class TestGridManager(unittest.TestCase):
 
         # ハーフクローズ済み状態にして、余分なクローズ注文を抑制
         self.manager.half_close_done = True
+        self.manager.zone_entered = True  # fixture already touched the zone
 
+        self.manager.last_m1_time = -60
+        rates = self._get_mock_rates(15, 2370.0, 2360.0, 2366.0)
+        mock_mt5.copy_rates_from_pos.return_value = rates
+        mock_mt5.symbol_info.return_value.trade_stops_level = 0
+        mock_mt5.symbol_info.return_value.point = .01
+        mock_mt5.symbol_info.return_value.filling_mode = 2
+        mock_sleep.side_effect = lambda seconds: (_ for _ in ()).throw(InterruptedError()) if seconds == 1 else None
         # ループを抜ける例外を受け取る前提で run_monitor を実行
-        with self.assertRaises(InterruptedError):
+        with self.assertRaises(BindingError):
             self.manager.run_monitor()
 
         # 1. 最良建値以外のポジション（pos_worst: 5002）が決済されていること
@@ -172,8 +184,11 @@ class TestGridManager(unittest.TestCase):
 
         # ハーフクローズ済み状態にする
         self.manager.half_close_done = True
+        self.manager.zone_entered = True  # fixture already touched the zone
 
-        with self.assertRaises(InterruptedError):
+        mock_mt5.positions_get.side_effect = [[pos], []]
+        mock_mt5.symbol_info.return_value.filling_mode = 2
+        with self.assertRaises(BindingError):
             self.manager.run_monitor()
 
         # 注文削除(TRADE_ACTION_REMOVE)とポジションクローズ(TRADE_ACTION_DEAL)が送られていること

@@ -1,5 +1,7 @@
 # xau-grid-bot
 
+**専用端末固定の変更案：[ローカル設定・停止条件・注文なし診断](TERMINAL_BINDING.md)**。VPS適用・再起動は未承認。既存起動コマンドにも `terminal.local.json` が必須になります。
+
 TradingViewなどからのWebhookリクエストをトリガーにして、MetaTrader 5 (MT5) と連動し、XAUUSD（ゴールド）のグリッドトレードを自動実行するPythonボットです。
 
 ---

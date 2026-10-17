@@ -1,10 +1,25 @@
 import MetaTrader5 as mt5
 import numpy as np
 import time
+from functools import wraps
+from terminal_binding import BindingError
+
+
+def guarded(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        try:
+            self.check_terminal()
+            return method(self, *args, **kwargs)
+        except Exception:
+            if self.binding is not None: self.binding.stop()
+            raise BindingError("売買処理停止。端末・口座と未確定注文を本人が確認してください。") from None
+    return call
 
 # --- 執行・監視クラス ---
 class GridManager:
-    def __init__(self, state, symbol="XAUUSD", volume=0.02, half_close_dist=10.0):
+    def __init__(self, state, symbol="XAUUSD", volume=0.02, half_close_dist=10.0, binding=None):
+        self.binding = binding
         self.state = state
         self.symbol = symbol
         self.volume = volume
@@ -14,6 +29,23 @@ class GridManager:
         self.half_close_done = False
         self.zone_entered = False
         self.last_m1_time = None
+
+    def check_terminal(self):
+        if self.binding is None:
+            raise BindingError('専用端末設定がありません。発注しません。')
+        self.binding.check(mt5, trading=True)
+
+    def send(self, request):
+        if self.binding is None:
+            raise BindingError('専用端末設定がありません。発注しません。')
+        # Keep result classification and the stop latch atomic across both workers.
+        with self.binding.lock:
+            self.check_terminal()
+            result = self.binding.send(mt5, request)
+            if result is None or getattr(result, 'retcode', None) not in (10008, 10009, 10010):
+                self.binding.stop()
+                raise BindingError('注文結果未確認または拒否。追加送信を停止し本人照合が必要です。')
+            return result
 
     def get_filling_mode(self):
         info = mt5.symbol_info(self.symbol)
@@ -75,6 +107,7 @@ class GridManager:
         except Exception as e:
             print(f"[Error] Discord通知の送信に失敗しました: {e}")
 
+    @guarded
     def place_grid_orders(self):
         # ゾーン内に5つの指値を配置 (現在価格との位置関係に応じてLIMIT/STOPを動的に切り替え)
         min_p = self.state.min_price
@@ -119,7 +152,7 @@ class GridManager:
                 "magic": 123456,
                 "type_filling": self.get_filling_mode(),
             }
-            result = mt5.order_send(request)
+            result = self.send(request)
             if result is None:
                 err_msg = f"注文送信失敗 (結果が返されませんでした): 価格 {price_r} ({order_type_str})"
                 print(err_msg)
@@ -151,12 +184,13 @@ class GridManager:
         self.send_discord_message(discord_text)
 
 
+    @guarded
     def close_all_positions(self):
         # 保有ポジションと指値を全決済・全キャンセル
         orders = mt5.orders_get(symbol=self.symbol)
         if orders:
             for order in orders:
-                mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket})
+                self.send({"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket})
 
         positions = mt5.positions_get(symbol=self.symbol)
         if positions:
@@ -180,7 +214,7 @@ class GridManager:
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": self.get_filling_mode(),
                 }
-                result = mt5.order_send(request)
+                result = self.send(request)
                 if result.retcode != mt5.TRADE_RETCODE_DONE:
                     print(f"ポジションクローズ失敗: ticket={pos.ticket}, retcode={result.retcode}")
         
@@ -208,12 +242,13 @@ class GridManager:
 
         print("全ポジション・注文のクリア処理が完了しました")
 
+    @guarded
     def handle_breakout_exit(self, is_buy):
         # 1. 未約定の注文（指値）を全てキャンセル
         orders = mt5.orders_get(symbol=self.symbol)
         if orders:
             for order in orders:
-                mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket})
+                self.send({"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket})
             print("未約定の指値注文をすべてキャンセルしました")
 
         # 2. ポジション取得
@@ -253,7 +288,7 @@ class GridManager:
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": self.get_filling_mode(),
             }
-            result = mt5.order_send(request)
+            result = self.send(request)
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 print(f"建値の悪いポジションをクローズしました: ticket={pos.ticket}, price_open={pos.price_open}")
             else:
@@ -305,7 +340,7 @@ class GridManager:
                 "sl": target_sl,
                 "tp": best_pos_updated.tp  # 既存のTPを維持
             }
-            result = mt5.order_send(sl_request)
+            result = self.send(sl_request)
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 print(f"最良ポジション {best_pos_updated.ticket} の逆指値(SL)を建値 {target_sl:.2f} に設定しました (リスクフリー化完了)")
             else:
@@ -313,6 +348,7 @@ class GridManager:
         else:
             print("リスクフリーSLの設定をスキップします。")
 
+    @guarded
     def check_and_execute_half_close(self, current_price):
         if self.half_close_done:
             return
@@ -353,7 +389,7 @@ class GridManager:
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": self.get_filling_mode(),
                 }
-                result = mt5.order_send(request)
+                result = self.send(request)
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
                     print(f"ポジション {pos.ticket} を半分決済しました (ロット: {pos.volume} -> {half_vol})")
                 else:
@@ -361,8 +397,10 @@ class GridManager:
                     
             self.half_close_done = True
 
+    @guarded
     def run_executor(self):
         while True:
+            self.check_terminal()
             if self.state.is_new_request:
                 self.close_all_positions()
                 self.place_grid_orders()
@@ -372,9 +410,11 @@ class GridManager:
                 self.state.is_new_request = False
             time.sleep(1)
 
+    @guarded
     def run_monitor(self):
         print("監視ループ開始...")
         while True:
+            self.check_terminal()
             # ゾーンが設定されており、かつ新規配置リクエストの処理が完了している場合のみ監視
             if self.state.min_price > 0 and not self.state.is_new_request:
                 tick = mt5.symbol_info_tick(self.symbol)
