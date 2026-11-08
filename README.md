@@ -22,25 +22,34 @@ TradingViewなどからのWebhookリクエストをトリガーにして、MetaT
 pip install -r requirements.txt
 ```
 
-### 3. ngrokを使用したWebhook受信用トンネリングの設定
-TradingViewなどの外部サービスからローカルのサーバーにリクエストを転送するために、`ngrok` で接続用のURLを固定（ドメイン指定）して起動します。
+### 3. Webhookトークンの作成
+`/webhook` はトークンが一致しないリクエストを `401` で拒否します。TradingViewはカスタムヘッダーを送れないため、トークンはJSON本文の `token` フィールドで送ります。
 
-```bash
-ngrok http --domain=awaited-oddly-squid.ngrok-free.app 8000
+プロジェクトのルートで以下を実行し、`webhook.local.token`（gitignore対象）を作成します。英数字・`_`・`-` のみ、32文字以上が必要です。ファイルが無い・形式が不正な場合、MT5に接続する前に起動を中止します。
+
+```powershell
+py -c "import secrets; open('webhook.local.token','w').write(secrets.token_urlsafe(32))"
 ```
 
-> [!TIP]
-> ngrokで固定ドメインを発行・設定する方法については、以下の解説記事などを参考にしてください。
-> - [【簡単】ngrokで発行されるURLを固定する (Zenn)](https://zenn.dev/y_taiki/articles/ngrok_domain)
+TradingViewでは `[kt] ZigZag Break Target` の設定 **「Webhook token」** にこのファイルと同じ値を入力し、アラートを作成し直します（アラートは作成時点の入力値を保持するため）。トークンをチャット・リポジトリ・スクリーンショットに残さないでください。漏えい時はファイルを作り直し、ボット再起動とアラート再作成を行います。
 
-### 4. アプリケーションの起動
-別のコマンドプロンプト（またはPowerShell）を起動し、以下のコマンドでボットのメインプロセスを実行します。
+### 4. Tailscale FunnelによるWebhook受信の公開
+サーバーは `127.0.0.1:8000` だけで待ち受けます。インターネットからの受信はTailscale Funnelで中継します（ngrokの固定ドメインは別ボットが使用中のため使いません）。
 
-```bash
+```powershell
+tailscale funnel --bg 8000
+```
+
+TradingViewのWebhook URLは `https://<マシン名>.<tailnet名>.ts.net/webhook` です。`tailscale funnel status` で設定を確認、`tailscale funnel --https=443 off` で公開を停止できます。
+
+### 5. アプリケーションの起動
+別のPowerShellを起動し、以下のコマンドでボットのメインプロセスを実行します。
+
+```powershell
 py .\main.py
 ```
 
-実行すると、FastAPIサーバーが `8000` 番ポートで待機を開始し、同時に価格とポジションの監視ループが動作し始めます。
+`--terminal-binding`（既定 `terminal.local.json`）と `--webhook-token`（既定 `webhook.local.token`）でファイルの場所を変更できます。実行すると、FastAPIサーバーが `127.0.0.1:8000` で待機を開始し、同時に価格とポジションの監視ループが動作し始めます。
 
 ---
 

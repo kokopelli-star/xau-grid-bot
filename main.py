@@ -4,7 +4,7 @@ import sys
 import threading
 from state import GridState
 from executor import GridManager
-from server import TradingServer
+from server import TradingServer, load_token
 from terminal_binding import TerminalSpec, TerminalBinding, BindingError
 from terminal_process import find_running_terminal
 import MetaTrader5 as mt5
@@ -13,12 +13,15 @@ import MetaTrader5 as mt5
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--terminal-binding', default='terminal.local.json')
+    parser.add_argument('--webhook-token', default='webhook.local.token')
     args = parser.parse_args()
     target = None
     attempted = False
     binding = None
     try:
         spec = TerminalSpec.load(args.terminal_binding)
+        # Load the secret before touching MT5 so a missing token never opens a session.
+        token = load_token(args.webhook_token)
         if sys.platform != 'win32':
             raise BindingError('Windows専用。接続しません。')
         target = find_running_terminal(expected_path=spec.exe)
@@ -29,7 +32,7 @@ def main():
             raise BindingError('対象端末への接続失敗。')
         binding.check(mt5, trading=True)
         state = GridState()
-        server = TradingServer(state)
+        server = TradingServer(state, token)
         manager = GridManager(state, binding=binding)
         # Worker exceptions latch the shared guard. The monitoring loop sees the
         # latch even when there is no zone, so another worker cannot keep trading.
