@@ -13,6 +13,7 @@ targetLo = input.float(1.38, "Target Low (138%)", step=0.01)
 targetHi = input.float(1.62, "Target High (162%)", step=0.01)
 boxBars = input.int(30, "Target Box Width (bars)", minval=1)
 maxKeep = input.int(100, "Max kept objects (lines/boxes/labels)", minval=10)
+webhookToken = input.string("", "Webhook token (webhook.local.tokenと同じ値)")
 
 // === Pivot ===
 ph = ta.pivothigh(high, depth, depth)
@@ -128,7 +129,7 @@ if retraceActive and barstate.isconfirmed
         // array.push(signals, lb)
         
         // Webhook用アラート送信
-        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "sell"}'
+        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "sell", "token": "' + webhookToken + '"}'
         alert(alert_msg, alert.freq_once_per_bar_close)
 
         retraceActive := false
@@ -145,7 +146,7 @@ if retraceActive and barstate.isconfirmed
         // array.push(signals, lb)
         
         // Webhook用アラート送信
-        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "buy"}'
+        alert_msg = '{"min": ' + str.tostring(tgtLow) + ', "max": ' + str.tostring(tgtHigh) + ', "direction": "buy", "token": "' + webhookToken + '"}'
         alert(alert_msg, alert.freq_once_per_bar_close)
 
         retraceActive := false

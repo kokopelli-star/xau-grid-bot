@@ -147,10 +147,18 @@ class LegacyGuardIntegrationTests(unittest.TestCase):
         guard,api=setup_guard();spec=guard.spec;target=guard.target
         api.initialize.return_value=True
         api.terminal_info.return_value.data_path=r'C:\OTHER'
-        with patch.object(main.sys,'argv',['main.py']),patch.object(main.sys,'platform','win32'),patch.object(main.TerminalSpec,'load',return_value=spec),patch.object(main,'find_running_terminal',return_value=target),patch.object(main,'mt5',api),patch.object(main,'GridManager') as manager:
+        with patch.object(main.sys,'argv',['main.py']),patch.object(main.sys,'platform','win32'),patch.object(main.TerminalSpec,'load',return_value=spec),patch.object(main,'find_running_terminal',return_value=target),patch.object(main,'mt5',api),patch.object(main,'load_token',return_value='t'*32),patch.object(main,'GridManager') as manager:
             self.assertEqual(main.main(),1)
             api.initialize.assert_called_once_with(spec.exe,timeout=10000)
             manager.assert_not_called();api.order_send.assert_not_called()
+
+    def test_main_missing_webhook_token_never_opens_mt5(self):
+        import main
+        from server import TokenError
+        guard,api=setup_guard()
+        with patch.object(main.sys,'argv',['main.py']),patch.object(main.sys,'platform','win32'),patch.object(main.TerminalSpec,'load',return_value=guard.spec),patch.object(main,'load_token',side_effect=TokenError()),patch.object(main,'find_running_terminal') as finder,patch.object(main,'mt5',api),patch.object(main,'TradingServer') as server:
+            self.assertEqual(main.main(),1)
+            finder.assert_not_called();api.initialize.assert_not_called();server.assert_not_called()
 
 class ReadOnlyDiagnosticTests(unittest.TestCase):
     def test_explicit_attach_required_no_import_otherwise(self):
