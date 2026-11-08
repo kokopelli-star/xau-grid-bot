@@ -34,7 +34,7 @@
 // ============================================================================
 
 //@version=5
-indicator("[kt] ZigZag Break Target v3 (Counter HTF)", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+indicator("[kt] ZigZag Break Target v3 - New Bot Auth", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
 
 // ============================================================================
 // === 入力パラメータ ===
@@ -96,6 +96,15 @@ boxBars      = input.int(30,  "Target Box Width (bars)", minval=1, group=grpDraw
 maxKeep      = input.int(100, "Max kept objects", minval=10, group=grpDraw)
 showFiltered = input.bool(false,"フィルタで除外したゾーンも灰色で描画", group=grpDraw)
 showPanel    = input.bool(true, "ステータスパネルを表示", group=grpDraw)
+
+// New bot専用copy: 元のzone計算とpayloadを維持し、送信時だけ認証envelope化。
+// tokenは入力欄へ本人が設定。ソースへ埋め込まない・共有/公開しない。
+boxbotToken = input.string("", "New bot webhook token (private)", group="New bot authentication")
+f_boxbot_envelope(string payload) =>
+    // URL-safe ASCIIのみ: quotes/backslashes/control文字がないのでJSON注入不可。
+    if str.length(str.match(boxbotToken, "^[A-Za-z0-9_-]{32,128}$")) != str.length(boxbotToken) or str.length(boxbotToken) < 32
+        runtime.error("New bot webhook token is missing or invalid")
+    '{"auth_token":"' + boxbotToken + '","payload":' + payload + '}'
 
 // ============================================================================
 // === 共通ヘルパー ===
@@ -396,7 +405,7 @@ if brokeUp or brokeDn
         if zCur.active
             msgSup = '{"ver":"' + alertVer + '","event":"cancel","id":"' + str.tostring(zCur.id) + '","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","time":' + f_i(time_close) + ',"trade_dir":"' + zCur.tradeDir + '","reason":"superseded"}'
             if alertCancel
-                alert(msgSup, alert.freq_once_per_bar_close)
+                alert(f_boxbot_envelope(msgSup), alert.freq_once_per_bar_close)
 
         zSeq += 1
         zCur.active   := true
@@ -417,14 +426,14 @@ if brokeUp or brokeDn
         tfMs = timeframe.in_seconds(timeframe.period) * 1000
         msg = '{"ver":"' + alertVer + '","event":"zone","id":"' + str.tostring(zCur.id) + '","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","time":' + f_i(time_close) + ',"wave_dir":"' + zCur.waveDir + '","trade_dir":"' + zCur.tradeDir + '","entry_mode":"' + entryMode + '","zone_min":' + f_p(zCur.lo) + ',"zone_max":' + f_p(zCur.hi) + ',"entry":' + f_p(zCur.entry) + ',"sl":' + f_p(zCur.sl) + ',"tp":' + f_p(zCur.tp) + ',"stale":' + (useCancelStale ? f_p(zCur.stale) : "null") + ',"rr":' + f_r(zCur.rr) + ',"base_high":' + f_p(sigHigh) + ',"base_low":' + f_p(sigLow) + ',"range":' + f_p(sigRange) + ',"atr":' + f_p(atr) + ',"htf_trend":' + str.tostring(htfTrend) + ',"valid_bars":' + (useExpire ? str.tostring(zoneValidBars) : "null") + ',"valid_until":' + (useExpire ? f_i(time_close + zoneValidBars * tfMs) : "null") + '}'
         if alertZone
-            alert(msg, alert.freq_once_per_bar_close)
+            alert(f_boxbot_envelope(msg), alert.freq_once_per_bar_close)
 
     // ⑦' 除外ゾーンの通知（発注対象外）。ゾーン状態を一切更新しないので id は出さない。
     //     reason は passed の評価順に合わせた最初の不成立要因を返す。
     if not passed and alertFiltered
         reasonF = not trendOk ? "trend" : not atrOk ? "atr" : not sessOk ? "session" : not rrOk ? "rr" : "slot"
         msgF = '{"ver":"' + alertVer + '","event":"zone_filtered","id":null,"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","time":' + f_i(time_close) + ',"wave_dir":"' + waveDirS + '","trade_dir":"' + tradeDirS + '","reason":"' + reasonF + '","zone_min":' + f_p(zl) + ',"zone_max":' + f_p(zh) + ',"entry":' + f_p(en) + ',"sl":' + f_p(sl) + ',"tp":' + f_p(tp) + ',"rr":' + f_r(rr) + ',"base_high":' + f_p(sigHigh) + ',"base_low":' + f_p(sigLow) + ',"range":' + f_p(sigRange) + ',"atr":' + f_p(atr) + ',"htf_trend":' + str.tostring(htfTrend) + '}'
-        alert(msgF, alert.freq_once_per_bar_close)
+        alert(f_boxbot_envelope(msgF), alert.freq_once_per_bar_close)
 
     armed  := false
     sigDir := ""
@@ -465,7 +474,7 @@ f_lifecycle(Zone z) =>
         if fire
             msg = '{"ver":"' + alertVer + '","event":"entry","id":"' + str.tostring(z.id) + '","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","time":' + f_i(time_close) + ',"trade_dir":"' + z.tradeDir + '","entry":' + f_p(fPrice) + ',"sl":' + f_p(z.sl) + ',"tp":' + f_p(z.tp) + ',"rr":' + f_r(z.rr) + ',"zone_min":' + f_p(z.lo) + ',"zone_max":' + f_p(z.hi) + '}'
             if alertEntry
-                alert(msg, alert.freq_once_per_bar_close)
+                alert(f_boxbot_envelope(msg), alert.freq_once_per_bar_close)
             lb = label.new(bar_index, fPrice, (isSell ? "SELL" : "BUY") + " @" + f_p(fPrice), style=isSell ? label.style_label_down : label.style_label_up, color=isSell ? color.new(color.red, 0) : color.new(color.green, 0), textcolor=color.white, size=size.small)
             array.push(signals, lb)
             if not na(z.bx)
@@ -475,7 +484,7 @@ f_lifecycle(Zone z) =>
             reason = blown ? "sl_before_entry" : stale ? "stale" : "expired"
             msg = '{"ver":"' + alertVer + '","event":"cancel","id":"' + str.tostring(z.id) + '","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","time":' + f_i(time_close) + ',"trade_dir":"' + z.tradeDir + '","reason":"' + reason + '"}'
             if alertCancel
-                alert(msg, alert.freq_once_per_bar_close)
+                alert(f_boxbot_envelope(msg), alert.freq_once_per_bar_close)
             if not na(z.bx)
                 f_expire(z.bx)
             z.active := false
